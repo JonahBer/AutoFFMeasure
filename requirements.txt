@@ -1,0 +1,3 @@
+# requirements.txt
+# Only one external dependency — tkinter ships with Python's stdlib.
+Pillow>=10.0.0
