@@ -27,6 +27,12 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+try:
+    import numpy as np
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Landmark definitions
@@ -86,6 +92,89 @@ TOTAL   = len(PROMPTS)
 
 
 # ---------------------------------------------------------------------------
+# MediaPipe Face Mesh index map
+# ---------------------------------------------------------------------------
+# Maps our named landmarks to MediaPipe Face Mesh indices (0-477 with refine).
+#
+# IMPORTANT: This tool uses MONITOR-side L/R convention:
+#   _L = appears on left side of the image  = subject's ANATOMICAL RIGHT
+#   _R = appears on right side of the image = subject's ANATOMICAL LEFT
+#
+# MediaPipe uses subject-anatomical convention internally. Therefore every
+# bilateral entry below is INVERTED relative to MediaPipe's own naming:
+# our "_L" maps to MediaPipe's "right" indices and vice versa.
+#
+# Indices reference: https://github.com/google/mediapipe/blob/master/
+#                    mediapipe/modules/face_geometry/data/canonical_face_model_uv_visualization.png
+
+MEDIAPIPE_INDEX_MAP = {
+    # ── Face outline (jaw silhouette) ─────────────────────────────────
+    # Monitor-left = subject's right side of jaw
+    "face_outline_lip_crease_L": 215,   # subject-right cheek hollow at lip level
+    "face_outline_lip_crease_R": 435,   # subject-left  cheek hollow at lip level
+    "face_under_ear_L":          172,   # subject-right jaw under ear
+    "face_under_ear_R":          397,   # subject-left  jaw under ear
+    "face_above_ear_L":          127,   # subject-right temple (above ear)
+    "face_above_ear_R":          356,   # subject-left  temple (above ear)
+    "cheekbone_outer_L":         234,   # subject-right widest cheek point
+    "cheekbone_outer_R":         454,   # subject-left  widest cheek point
+
+    # ── Brows ─────────────────────────────────────────────────────────
+    "eyebrow_outside_L":         70,    # subject-right brow outer end
+    "eyebrow_outside_R":         300,   # subject-left  brow outer end
+    "eyebrow_inside_L":          55,    # subject-right brow inner end
+    "eyebrow_inside_R":          285,   # subject-left  brow inner end
+    "eyebrow_under_apex_L":      52,    # subject-right brow lower-apex
+    "eyebrow_under_apex_R":      282,   # subject-left  brow lower-apex
+    "eyebrow_upper_apex_L":      105,   # subject-right brow upper-apex
+    "eyebrow_upper_apex_R":      334,   # subject-left  brow upper-apex
+    "glabella":                  9,     # midline between brows
+
+    # ── Eyes ──────────────────────────────────────────────────────────
+    "eye_upper_apex_L":          159,   # subject-right upper eyelid apex
+    "eye_upper_apex_R":          386,   # subject-left  upper eyelid apex
+    "eye_upper_apex_crease_L":   223,   # subject-right upper eyelid crease
+    "eye_upper_apex_crease_R":   443,   # subject-left  upper eyelid crease
+    "eye_outside_corner_L":      33,    # subject-right outer canthus
+    "eye_outside_corner_R":      263,   # subject-left  outer canthus
+    "eye_inside_corner_L":       133,   # subject-right inner canthus
+    "eye_inside_corner_R":       362,   # subject-left  inner canthus
+    "eye_under_apex_L":          145,   # subject-right lower eyelid apex
+    "eye_under_apex_R":          374,   # subject-left  lower eyelid apex
+
+    # ── Nose ──────────────────────────────────────────────────────────
+    "nose_bottom_middle":        2,     # midline below nose tip (columella base)
+    "nose_nostril_outside_L":    98,    # subject-right nostril outer rim
+    "nose_nostril_outside_R":    327,   # subject-left  nostril outer rim
+    "alar_base_L":               209,   # subject-right alar crease (where nose meets cheek)
+    "alar_base_R":               429,   # subject-left  alar crease
+
+    # ── Chin / jaw ────────────────────────────────────────────────────
+    "chin_outer_side_L":         150,   # subject-right chin outer corner
+    "chin_outer_side_R":         379,   # subject-left  chin outer corner
+    "chin_bottom_apex":          152,   # midline chin tip
+
+    # ── Mouth / lips ──────────────────────────────────────────────────
+    "mouth_upper_apex_side_L":   37,    # subject-right upper lip peak
+    "mouth_upper_apex_side_R":   267,   # subject-left  upper lip peak
+    "philtrum_peak_L":           39,    # subject-right cupid's bow peak
+    "philtrum_peak_R":           269,   # subject-left  cupid's bow peak
+    "mouth_upper_low_u":         0,     # midline upper lip valley (cupid's bow center)
+    "lips_center_meet":          13,    # midline where lips meet (inner upper lip)
+    "lips_outer_crease_L":       61,    # subject-right mouth corner
+    "lips_outer_crease_R":       291,   # subject-left  mouth corner
+    "mouth_under_apex_L":        84,    # subject-right lower lip apex
+    "mouth_under_apex_R":        314,   # subject-left  lower lip apex
+    "lip_bottom_center":         17,    # midline bottom of lower lip
+
+    # ── Neck ──────────────────────────────────────────────────────────
+    # MediaPipe's mesh ends at the jawline; neck-face corner has no exact match.
+    # Using the jaw point closest to where neck typically meets face as a fallback.
+    "neck_face_corner_L":        58,    # subject-right jaw near neck
+    "neck_face_corner_R":        288,   # subject-left  jaw near neck
+}
+
+# ---------------------------------------------------------------------------
 # Colours / geometry
 # ---------------------------------------------------------------------------
 
@@ -94,6 +183,8 @@ RIGHT_COLOR     = "#ff6b35"
 SINGLE_COLOR    = "#a8ff3e"
 ESTIMATED_COLOR = "#ffcc00"   # mirrored / auto-estimated point
 SKIPPED_COLOR   = "#555566"   # point explicitly skipped
+MAPPED_COLOR    = "#000000"   # 100%-match target position
+MAPPED_ARROW    = "#555555"   # connecting arrow from real → mapped
 RADIUS          = 5
 HIT_RADIUS      = 12
 
@@ -111,18 +202,20 @@ TAB_BORDER      = "#2a2a4a"
 
 @dataclass
 class Workspace:
-    name:           str   = "Tab 1"
-    original_image: object = None
-    image_stem:     str   = "landmarks"
-    landmarks:      dict  = field(default_factory=dict)   # key -> (x, y) — real + estimated
-    skipped_keys:   set   = field(default_factory=set)    # keys user explicitly skipped
-    estimated_keys: set   = field(default_factory=set)    # keys filled by mirror / fallback
-    current_step:   int   = 0
-    marking_mode:   bool  = False
-    scale_factor:   float = 1.0
-    zoom_str:       str   = "Fit"
-    scroll_x:       float = 0.0
-    scroll_y:       float = 0.0
+    name:             str   = "Tab 1"
+    original_image:   object = None
+    image_stem:       str   = "landmarks"
+    landmarks:        dict  = field(default_factory=dict)
+    skipped_keys:     set   = field(default_factory=set)
+    estimated_keys:   set   = field(default_factory=set)
+    mapped_landmarks: dict  = field(default_factory=dict)  # key->(x,y) for 100% target overlay
+    mapped_label:     str   = ""                            # e.g. "A→B"
+    current_step:     int   = 0
+    marking_mode:     bool  = False
+    scale_factor:     float = 1.0
+    zoom_str:         str   = "Fit"
+    scroll_x:         float = 0.0
+    scroll_y:         float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +373,12 @@ class FaceLandmarkApp(tk.Tk):
                                   command=self.skip_current_point,
                                   state="disabled")
         self.skip_btn.pack(side="right", padx=(0, 8))
+
+        self.auto_btn = tk.Button(pb, text="Auto-Detect", bg="#1a1a40", fg="#44ddaa",
+                                  font=("Helvetica", 9, "bold"), relief="flat",
+                                  padx=10, pady=6, cursor="hand2",
+                                  command=self.auto_detect_landmarks)
+        self.auto_btn.pack(side="right", padx=(0, 4))
 
         # ── Main area ─────────────────────────────────────────────────
         main_frame = ttk.Frame(self)
@@ -486,18 +585,43 @@ class FaceLandmarkApp(tk.Tk):
 
         self.zoom_var.set(ws.zoom_str)
 
-        # Repopulate landmark list
+        # Repopulate landmark list (uses full status-aware rebuild)
         self.landmark_listbox.delete(0, tk.END)
-        for k, (x, y) in ws.landmarks.items():
-            self.landmark_listbox.insert(tk.END, f"{k:<28}  ({x:>4}, {y:>4})")
-            side = k.split("_")[-1]
-            c = LEFT_COLOR if side=="L" else RIGHT_COLOR if side=="R" else SINGLE_COLOR
-            self.landmark_listbox.itemconfig(tk.END, fg=c)
+        for p in PROMPTS:
+            k = p["key"]
+            if k in ws.skipped_keys and k not in ws.landmarks:
+                self.landmark_listbox.insert(tk.END, f"{k:<28}  SKIPPED")
+                self.landmark_listbox.itemconfig(tk.END, fg=SKIPPED_COLOR)
+            elif k in ws.estimated_keys:
+                if k in ws.landmarks:
+                    x, y = ws.landmarks[k]
+                    self.landmark_listbox.insert(tk.END, f"{k:<28}  ~({x:>4}, {y:>4})")
+                    self.landmark_listbox.itemconfig(tk.END, fg=ESTIMATED_COLOR)
+            elif k in ws.landmarks:
+                x, y = ws.landmarks[k]
+                # If mapping tab, also show mapped position
+                if k in ws.mapped_landmarks:
+                    mx, my = ws.mapped_landmarks[k]
+                    self.landmark_listbox.insert(
+                        tk.END, f"{k:<28}  ({x:>4},{y:>4}) → ({mx:>4},{my:>4})")
+                else:
+                    self.landmark_listbox.insert(tk.END, f"{k:<28}  ({x:>4}, {y:>4})")
+                side = k.split("_")[-1]
+                c = LEFT_COLOR if side=="L" else RIGHT_COLOR if side=="R" else SINGLE_COLOR
+                self.landmark_listbox.itemconfig(tk.END, fg=c)
 
         # Restore prompt banner
         if ws.original_image is None:
             self.prompt_var.set("Open or paste an image, then press  Start Marking")
             self.step_var.set("")
+        elif ws.mapped_landmarks:
+            # Mapping view
+            self.prompt_var.set(
+                f"  Mapping view: {ws.mapped_label}  |  "
+                f"Coloured = actual  ·  Black diamonds = 100% target  ·  "
+                f"Arrows show required change")
+            self.step_var.set(f"{len(ws.mapped_landmarks)} mapped")
+            self.skip_btn.config(state="disabled")
         elif ws.current_step >= TOTAL:
             self.prompt_var.set(f"  All {TOTAL} landmarks recorded.  Export with JSON or CSV")
             self.step_var.set(f"{TOTAL} / {TOTAL}  complete")
@@ -618,6 +742,23 @@ class FaceLandmarkApp(tk.Tk):
             color  = ESTIMATED_COLOR if is_est else _marker_color(key)
             self._draw_marker(cx, cy, key, color, estimated=is_est)
 
+        # Draw mapped (100%-target) markers and connecting arrows
+        if ws.mapped_landmarks:
+            for key, (mx, my) in ws.mapped_landmarks.items():
+                cmx = int(mx * sf)
+                cmy = int(my * sf)
+                # Connecting arrow from real → mapped position
+                if key in ws.landmarks:
+                    ox, oy = ws.landmarks[key]
+                    cox, coy = int(ox * sf), int(oy * sf)
+                    if abs(cmx - cox) > 2 or abs(cmy - coy) > 2:
+                        self.canvas.create_line(
+                            cox, coy, cmx, cmy,
+                            fill=MAPPED_ARROW, width=1, dash=(4, 3),
+                            arrow=tk.LAST, arrowshape=(6, 8, 3),
+                            tags=("mapped_marker",))
+                self._draw_mapped_marker(cmx, cmy, key)
+
     def _draw_placeholder(self):
         self.canvas.delete("all")
         self.canvas.create_text(
@@ -649,9 +790,24 @@ class FaceLandmarkApp(tk.Tk):
                                      font=("Helvetica", 7), anchor="w",
                                      tags=("marker", tag))
 
-    # ------------------------------------------------------------------
-    # Scroll / zoom
-    # ------------------------------------------------------------------
+    def _draw_mapped_marker(self, cx: int, cy: int, key: str):
+        """Black diamond marker for the 100%-similarity target position."""
+        r   = RADIUS + 1
+        tag = f"mp_{key}"
+        self.canvas.delete(tag)
+        # Diamond polygon
+        self.canvas.create_polygon(
+            cx, cy - r,
+            cx + r, cy,
+            cx, cy + r,
+            cx - r, cy,
+            fill=MAPPED_COLOR, outline="#ffffff", width=1,
+            tags=("mapped_marker", tag))
+        self.canvas.create_text(
+            cx + r + 4, cy,
+            text=f">{_short_label(key)}",
+            fill=MAPPED_COLOR, font=("Helvetica", 7), anchor="w",
+            tags=("mapped_marker", tag))
 
     def _on_pan_vertical(self, event):
         if   event.num == 4: self.canvas.yview_scroll(-1, "units")
@@ -1135,20 +1291,14 @@ class FaceLandmarkApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _compute_estimated_points(self) -> int:
-        """
-        For each skipped/missing landmark:
-          1. Bilateral: reflect opposite side across the face's PCA axis
-             (accounts for head tilt — uses all placed points to fit the axis)
-          2. Single: estimate from neighbouring available points
-        Stores results in ws.landmarks + ws.estimated_keys.
-        Returns number of new estimates added.
-        """
         ws = self.ws
         n_before = len(ws.estimated_keys)
 
-        axis = _face_axis(ws.landmarks)   # (cx, cy, dx, dy) or None
+        axis = _face_axis(ws.landmarks)
+        r    = _bilateral_half_ratio(ws.landmarks,
+                                     axis[0] if axis else 0.0)
+        r    = max(0.5, min(2.0, r))
 
-        # ── Pass 1: mirror bilateral skipped points across face axis ──
         for key in list(ws.skipped_keys):
             if key in ws.landmarks:
                 continue
@@ -1158,12 +1308,20 @@ class FaceLandmarkApp(tk.Tk):
                     and axis is not None):
                 ax, ay, dx, dy = axis
                 ox, oy = ws.landmarks[mirror_key]
-                ws.landmarks[key] = _mirror_across_axis(ox, oy, ax, ay, dx, dy)
+                ex, ey = _mirror_across_axis(ox, oy, ax, ay, dx, dy)
+                # Apply yaw foreshortening to the horizontal displacement
+                vx = ox - ax
+                vy = oy - ay
+                perp_component = vx * dy + vy * (-dx)
+                horiz_disp = ex - ax
+                if perp_component > 0:
+                    ex = int(round(ax + horiz_disp * r))
+                else:
+                    ex = int(round(ax + horiz_disp / r))
+                ws.landmarks[key]    = (ex, ey)
                 ws.estimated_keys.add(key)
 
-        # ── Pass 2: estimate single (non-bilateral) skipped points ────
         _estimate_singles(ws.landmarks, ws.estimated_keys)
-
         return len(ws.estimated_keys) - n_before
 
     # ------------------------------------------------------------------
@@ -1186,6 +1344,156 @@ class FaceLandmarkApp(tk.Tk):
             "Ctrl+Scroll       zoom toward cursor\n\n"
             "Requires: Pillow  (pip install Pillow)"
         ))
+
+    # ------------------------------------------------------------------
+    # MediaPipe auto-detection
+    # ------------------------------------------------------------------
+
+    def _get_face_mesh(self):
+        """Lazily initialize the FaceMesh model. Returns None if unavailable."""
+        if not MEDIAPIPE_AVAILABLE:
+            return None
+        if not hasattr(self, "_face_mesh") or self._face_mesh is None:
+            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+            )
+        return self._face_mesh
+
+    def auto_detect_landmarks(self):
+        """Run MediaPipe Face Mesh on the current image and populate all
+        landmarks as estimated. Wipes any existing landmarks first."""
+        if not MEDIAPIPE_AVAILABLE:
+            messagebox.showerror(
+                "MediaPipe not installed",
+                "Auto-detect requires MediaPipe and NumPy.\n\n"
+                "Install with:\n"
+                "  pip install mediapipe numpy"
+            )
+            return
+
+        ws = self.ws
+        if ws.original_image is None:
+            messagebox.showinfo("No image", "Load an image first.")
+            return
+
+        face_mesh = self._get_face_mesh()
+        if face_mesh is None:
+            messagebox.showerror("MediaPipe error", "Could not initialize Face Mesh.")
+            return
+
+        self.status_var.set("Running MediaPipe face detection...")
+        self.update_idletasks()
+
+        try:
+            rgb = np.array(ws.original_image.convert("RGB"))
+            result = face_mesh.process(rgb)
+        except Exception as exc:
+            messagebox.showerror("Detection failed", f"MediaPipe error:\n{exc}")
+            self.status_var.set("Auto-detect failed.")
+            return
+
+        if not result.multi_face_landmarks:
+            messagebox.showwarning(
+                "No face found",
+                "MediaPipe could not detect a face in this image.\n"
+                "Try a clearer frontal image, or place landmarks manually."
+            )
+            self.status_var.set("No face detected.")
+            return
+
+        h, w = rgb.shape[:2]
+        mesh = result.multi_face_landmarks[0].landmark
+        n_mesh = len(mesh)
+
+        # Wipe all existing state (per option A)
+        ws.landmarks.clear()
+        ws.skipped_keys.clear()
+        ws.estimated_keys.clear()
+        ws.marking_mode = False
+        ws.current_step = TOTAL
+        self.canvas.delete("marker")
+        self.skip_btn.config(state="disabled")
+
+        # Populate from MediaPipe, marking each as estimated
+        n_placed = 0
+        n_missed = 0
+        for our_key, mesh_idx in MEDIAPIPE_INDEX_MAP.items():
+            if mesh_idx >= n_mesh:
+                n_missed += 1
+                continue
+            pt = mesh[mesh_idx]
+            x = int(round(pt.x * w))
+            y = int(round(pt.y * h))
+            x = max(0, min(x, w - 1))
+            y = max(0, min(y, h - 1))
+            ws.landmarks[our_key] = (x, y)
+            ws.estimated_keys.add(our_key)
+            n_placed += 1
+
+        self.refresh_display()
+        self._rebuild_list_panel()
+
+        msg = (f"Auto-detected {n_placed} landmarks.\n\n"
+               "All points are marked as estimated (yellow dashed). "
+               "Drag any that look misplaced — dragging promotes them to placed.")
+        if n_missed:
+            msg += f"\n\n{n_missed} mesh indices were out of range (unexpected)."
+
+        self.prompt_var.set(
+            f"  Auto-detected — {n_placed} estimated.  "
+            f"Drag to correct any misplaced points.")
+        self.step_var.set(f"{n_placed} / {TOTAL}  estimated")
+        self.status_var.set(f"Auto-detect complete: {n_placed} landmarks placed as estimated.")
+
+        messagebox.showinfo("Auto-detect complete", msg)
+
+    # ------------------------------------------------------------------
+    # Mapping tab  (opens a new tab showing original + 100%-target overlay)
+    # ------------------------------------------------------------------
+
+    def open_mapping_tab(self, ws_source, ws_target, name_src: str, name_tgt: str):
+        """
+        Create a new tab containing ws_source's image with:
+          • Coloured markers  — ws_source's actual landmark positions
+          • Black diamonds    — where those landmarks would need to be
+                                for 100% similarity with ws_target
+          • Grey dashed arrows connecting each pair
+        """
+        if ws_source.original_image is None:
+            messagebox.showerror("No image", f"'{name_src}' has no image."); return
+
+        mapped = compute_mapped_landmarks(ws_source, ws_target)
+        if not mapped:
+            messagebox.showerror(
+                "Cannot map",
+                "Not enough landmarks to compute the mapping.\n"
+                "Make sure both faces have at least brow and chin points placed."
+            ); return
+
+        # Snapshot the current tab before we switch away
+        self._snapshot_current()
+
+        # Build new workspace
+        new_ws                  = Workspace()
+        new_ws.name             = f"Map: {name_src} → {name_tgt}"
+        new_ws.original_image   = ws_source.original_image.copy()
+        new_ws.image_stem       = f"map_{name_src}_to_{name_tgt}".replace(" ", "_")
+        new_ws.landmarks        = dict(ws_source.landmarks)
+        new_ws.skipped_keys     = set(ws_source.skipped_keys)
+        new_ws.estimated_keys   = set(ws_source.estimated_keys)
+        new_ws.mapped_landmarks = mapped
+        new_ws.mapped_label     = f"{name_src} → {name_tgt}"
+        new_ws.zoom_str         = "Fit"
+        new_ws.scale_factor     = 1.0
+        new_ws.marking_mode     = False
+        new_ws.current_step     = TOTAL  # read-only view
+
+        self.workspaces.append(new_ws)
+        self.active_idx = len(self.workspaces) - 1
+        self._restore_workspace(self.active_idx)
 
     # ------------------------------------------------------------------
     # Compare
@@ -1229,59 +1537,124 @@ def _mirror_key(key: str) -> Optional[str]:
     return None
 
 
+# Singleton midline anatomy keys (each is a single sample on the midline).
+_MIDLINE_KEYS = [
+    "glabella",
+    "nose_bottom_middle",
+    "mouth_upper_low_u",
+    "lips_center_meet",
+    "lip_bottom_center",
+    "chin_bottom_apex",
+]
+
+# Every bilateral pair contributes its midpoint as a midline sample.
+# The midpoint of (P_L, P_R) lies on the apparent symmetry line regardless
+# of how wide the pair is, so wide pairs (jaw, cheeks) are NOT a problem
+# — they are extra information, not a sideways pull. Furthermore, a
+# bilateral midpoint averages out the user's per-side click error,
+# so it has roughly half the variance of a singleton midline click.
+_BILATERAL_PAIRS_FOR_AXIS = [
+    ("face_outline_lip_crease_L", "face_outline_lip_crease_R"),
+    ("face_under_ear_L",          "face_under_ear_R"),
+    ("face_above_ear_L",          "face_above_ear_R"),
+    ("cheekbone_outer_L",         "cheekbone_outer_R"),
+    ("eyebrow_outside_L",         "eyebrow_outside_R"),
+    ("eyebrow_inside_L",          "eyebrow_inside_R"),
+    ("eyebrow_under_apex_L",      "eyebrow_under_apex_R"),
+    ("eyebrow_upper_apex_L",      "eyebrow_upper_apex_R"),
+    ("eye_upper_apex_L",          "eye_upper_apex_R"),
+    ("eye_upper_apex_crease_L",   "eye_upper_apex_crease_R"),
+    ("eye_outside_corner_L",      "eye_outside_corner_R"),
+    ("eye_inside_corner_L",       "eye_inside_corner_R"),
+    ("eye_under_apex_L",          "eye_under_apex_R"),
+    ("nose_nostril_outside_L",    "nose_nostril_outside_R"),
+    ("alar_base_L",               "alar_base_R"),
+    ("chin_outer_side_L",         "chin_outer_side_R"),
+    ("mouth_upper_apex_side_L",   "mouth_upper_apex_side_R"),
+    ("philtrum_peak_L",           "philtrum_peak_R"),
+    ("lips_outer_crease_L",       "lips_outer_crease_R"),
+    ("mouth_under_apex_L",        "mouth_under_apex_R"),
+    ("neck_face_corner_L",        "neck_face_corner_R"),
+]
+
+
 def _face_axis(landmarks: dict):
     """
     Compute the face's central axis as (cx, cy, dx, dy):
-      (cx, cy) — centroid of available centre-line points
-      (dx, dy) — unit direction vector along the axis (pointing downward)
+      (cx, cy) — origin on the apparent face symmetry line.
+      (dx, dy) — unit vector along the axis (pointing toward the chin).
 
-    Uses PCA on centre-line points so a tilted head is handled correctly.
-    Falls back progressively to midpoints of bilateral pairs, then vertical.
+    Centroid is built from BOTH singleton midline anatomy AND the midpoints
+    of every available bilateral pair. The bilateral midpoints dominate
+    the count (roughly 21 vs 6 in a fully-marked face), and crucially the
+    averaging of L/R clicks cancels per-side click bias — the single
+    biggest source of the lateral skew the diamond markers used to show.
+
+    PCA on the same point set gives the axis tilt; anatomy (chin vs brow)
+    disambiguates the axis direction.
     """
-    centre_keys = ["glabella", "nose_bottom_middle", "mouth_upper_low_u",
-                   "lips_center_meet", "chin_bottom_apex"]
-    pts = [landmarks[k] for k in centre_keys if k in landmarks]
+    samples = []  # each entry is one sample on the midline
 
-    # Supplement with midpoints of any bilateral pairs present
-    bilateral_mids = []
-    seen_bases = set()
-    for k, v in landmarks.items():
-        if k.endswith("_L"):
-            base = k[:-2]
-            rk   = base + "_R"
-            if rk in landmarks and base not in seen_bases:
-                seen_bases.add(base)
-                lp, rp = landmarks[k], landmarks[rk]
-                bilateral_mids.append(((lp[0]+rp[0])/2, (lp[1]+rp[1])/2))
+    # Singleton midline anatomy — each is one sample.
+    for k in _MIDLINE_KEYS:
+        if k in landmarks:
+            samples.append(landmarks[k])
 
-    all_pts = pts + bilateral_mids
-    if not all_pts:
+    # Every bilateral pair midpoint is one sample. Each is statistically
+    # better than a singleton midline click (per-side click error cancels).
+    for lk, rk in _BILATERAL_PAIRS_FOR_AXIS:
+        if lk in landmarks and rk in landmarks:
+            lp = landmarks[lk]
+            rp = landmarks[rk]
+            samples.append(((lp[0] + rp[0]) / 2.0, (lp[1] + rp[1]) / 2.0))
+
+    if not samples:
         return None
 
-    cx = sum(p[0] for p in all_pts) / len(all_pts)
-    cy = sum(p[1] for p in all_pts) / len(all_pts)
+    cx = sum(p[0] for p in samples) / len(samples)
+    cy = sum(p[1] for p in samples) / len(samples)
 
-    if len(all_pts) < 2:
-        return (cx, cy, 0.0, 1.0)   # single point → assume vertical
+    if len(samples) < 2:
+        return (cx, cy, 0.0, 1.0)
 
-    # PCA: eigenvector of the larger eigenvalue of the 2×2 covariance matrix
-    sxx = sum((p[0]-cx)**2 for p in all_pts)
-    syy = sum((p[1]-cy)**2 for p in all_pts)
-    sxy = sum((p[0]-cx)*(p[1]-cy) for p in all_pts)
+    # ── Tilt (PCA) on the same combined sample set ────────────────────
+    sxx = sum((p[0] - cx) ** 2 for p in samples)
+    syy = sum((p[1] - cy) ** 2 for p in samples)
+    sxy = sum((p[0] - cx) * (p[1] - cy) for p in samples)
 
     diff = (sxx - syy) / 2.0
-    hyp  = math.sqrt(diff**2 + sxy**2) if (diff**2 + sxy**2) > 0 else 0.0
+    hyp  = math.sqrt(diff * diff + sxy * sxy)
 
-    vx = diff + hyp
-    vy = sxy
-    mag = math.sqrt(vx**2 + vy**2)
+    vx  = diff + hyp
+    vy  = sxy
+    mag = math.sqrt(vx * vx + vy * vy)
     if mag < 1e-9:
         dx, dy = 0.0, 1.0
     else:
         dx, dy = vx / mag, vy / mag
 
-    # Ensure direction points downward (screen y increases downward)
-    if dy < 0:
+    # ── Resolve axis direction by anatomy: chin should sit at +along ──
+    # Vote across as many along-axis anchors as we have, so a single
+    # mis-clicked landmark cannot flip the entire frame.
+    score = 0.0
+    chin = landmarks.get("chin_bottom_apex")
+    if chin:
+        score += (chin[0] - cx) * dx + (chin[1] - cy) * dy
+    # Brow midpoint should be at -along.
+    bL = landmarks.get("eyebrow_upper_apex_L")
+    bR = landmarks.get("eyebrow_upper_apex_R")
+    if bL and bR:
+        bx = (bL[0] + bR[0]) / 2.0
+        by = (bL[1] + bR[1]) / 2.0
+        score -= (bx - cx) * dx + (by - cy) * dy
+    glab = landmarks.get("glabella")
+    if glab:
+        score -= (glab[0] - cx) * dx + (glab[1] - cy) * dy
+
+    if score < 0:
+        dx, dy = -dx, -dy
+    elif score == 0 and dy < 0:
+        # No anatomy info at all: default to "axis points down".
         dx, dy = -dx, -dy
 
     return (cx, cy, dx, dy)
@@ -1341,24 +1714,265 @@ def _estimate_singles(lm: dict, est: set):
 def _effective_landmarks(ws) -> dict:
     """
     Return a fully-populated landmarks dict for metric computation.
-    Runs tilt-aware estimation on a copy — does NOT modify the workspace.
+    Runs tilt + yaw-aware estimation on a copy — does NOT modify the workspace.
     """
-    lm  = dict(ws.landmarks)
-    est = set(ws.estimated_keys)
+    lm   = dict(ws.landmarks)
+    est  = set(ws.estimated_keys)
     axis = _face_axis(lm)
 
     all_keys = set(p["key"] for p in PROMPTS)
     for key in all_keys:
-        if key in lm: continue
+        if key in lm:
+            continue
         mk = _mirror_key(key)
         if mk and mk in lm and axis is not None:
             ax, ay, dx, dy = axis
+            # Compute yaw ratio so the reflection accounts for foreshortening
+            r = _bilateral_half_ratio(lm, ax)
+            r = max(0.5, min(2.0, r))
             ox, oy = lm[mk]
-            lm[key] = _mirror_across_axis(ox, oy, ax, ay, dx, dy)
+            ex, ey = _mirror_across_axis(ox, oy, ax, ay, dx, dy)
+            # Adjust the horizontal offset by the foreshortening ratio
+            # The reflected point is on the opposite side: apply scale
+            perp_dir_x = dy   # perpendicular to axis (not yet sign-checked, just for ratio)
+            # Determine if source (mk) is on the _R (positive perp) side
+            vx = ox - ax
+            vy = oy - ay
+            from math import sqrt as _sqrt
+            perp_component = vx * dy + vy * (-dx)  # dot with (dy, -dx)
+            if perp_component > 0:
+                # mk is _R side (positive perp), reflected key is _L side
+                # _R apparent width may differ from _L apparent width by ratio r
+                # Scale the reflected horizontal displacement
+                horiz_disp = ex - ax
+                ex = int(round(ax + horiz_disp * r))
+            else:
+                # mk is _L side, reflected key is _R side
+                horiz_disp = ex - ax
+                ex = int(round(ax + horiz_disp / r))
+            lm[key] = (ex, ey)
             est.add(key)
 
     _estimate_singles(lm, est)
     return lm
+
+
+def _bilateral_half_ratio(landmarks: dict, cx: float) -> float:
+    """
+    Estimate the left/right apparent width ratio from bilateral landmark pairs.
+
+    Assumes the face is anatomically symmetric. Any consistent asymmetry in
+    how far _L vs _R landmarks sit from the midline is due to face yaw.
+
+    Returns r = median(d_L / d_R) where:
+      d_L = distance from centroid to each _L point (image-left side)
+      d_R = distance from centroid to each _R point (image-right side)
+
+    r = 1.0  → frontal / symmetric
+    r > 1.0  → _L side appears wider → face rotated so _L side faces camera more
+    r < 1.0  → _R side appears wider → face rotated toward _R
+    """
+    ratios = []
+    seen   = set()
+    for k in landmarks:
+        if not k.endswith("_L"):
+            continue
+        base = k[:-2]
+        if base in seen:
+            continue
+        rk = base + "_R"
+        if rk not in landmarks:
+            continue
+        seen.add(base)
+        d_L = cx - landmarks[k][0]    # how far _L point sits left of centroid
+        d_R = landmarks[rk][0] - cx   # how far _R point sits right of centroid
+        if d_L > 2 and d_R > 2:
+            ratios.append(d_L / d_R)
+
+    if not ratios:
+        return 1.0
+    ratios.sort()
+    return ratios[len(ratios) // 2]   # median — robust against individual outliers
+
+
+_RIGHT_PERP_ANCHORS = [
+    "face_outline_lip_crease_R",
+    "cheekbone_outer_R",
+    "face_under_ear_R",
+    "face_above_ear_R",
+    "eye_outside_corner_R",
+    "eyebrow_outside_R",
+    "eyebrow_upper_apex_R",
+    "lips_outer_crease_R",
+    "chin_outer_side_R",
+    "neck_face_corner_R",
+    "eye_inside_corner_R",
+    "eyebrow_inside_R",
+    "mouth_upper_apex_side_R",
+    "alar_base_R",
+    "nose_nostril_outside_R",
+    "philtrum_peak_R",
+]
+
+
+def _resolve_perp_sign(px: float, py: float, lm: dict,
+                       cx: float, cy: float) -> tuple:
+    """
+    Decide whether perp = (dy, -dx) or its negation.
+
+    Vote across EVERY available right-side anchor; do NOT break on the
+    first one found. The first-anchor-wins approach used previously is
+    fragile because a single anchor sitting near the centroid (e.g. a
+    narrow Sims-4 nostril when the centroid happens to be biased a
+    couple of pixels) can flip the perp axis catastrophically and
+    every diamond ends up reflected to the wrong side.
+    """
+    score = 0.0
+    n = 0
+    for k in _RIGHT_PERP_ANCHORS:
+        if k in lm:
+            rx, ry = lm[k]
+            score += (rx - cx) * px + (ry - cy) * py
+            n += 1
+    if n == 0:
+        return (px, py)
+    if score < 0:
+        return (-px, -py)
+    return (px, py)
+
+
+def _shrink_yaw_ratio(r: float, n_pairs: int,
+                      threshold: float = 0.10) -> float:
+    """
+    Shrink the bilateral half-width ratio toward 1.0 (no yaw) so that
+    click jitter on a frontal face does not produce a fake yaw signal.
+
+    On a perfectly frontal Sims-4 portrait, ordinary click noise
+    routinely yields raw r values in roughly [0.93, 1.07]. Treating
+    those as real foreshortening produces an asymmetric per-side scale
+    factor (one side stretched, the other compressed) — which is
+    exactly the "lateral skew" the diamond markers used to show.
+
+    We map raw r into log space, subtract a `threshold` of magnitude
+    `|log r| < threshold`, and fold what's left back into linear space.
+    Effect:
+      • Frontal-with-noise (|log r| ≤ threshold) → r' = 1.0  (no scale).
+      • Real yaw of moderate size (|log r| > threshold) → still applied,
+        but its magnitude is reduced by `threshold` units.
+      • Very few pairs available → r' = 1.0 (the estimate is too noisy).
+    """
+    if n_pairs < 4:
+        return 1.0
+    lr = math.log(max(1e-6, r))
+    if abs(lr) <= threshold:
+        return 1.0
+    return math.exp(math.copysign(abs(lr) - threshold, lr))
+
+
+def _bilateral_half_ratio_with_count(landmarks: dict, cx: float) -> tuple:
+    """Like _bilateral_half_ratio but also reports how many pairs voted."""
+    ratios = []
+    seen = set()
+    for k in landmarks:
+        if not k.endswith("_L"):
+            continue
+        base = k[:-2]
+        if base in seen:
+            continue
+        rk = base + "_R"
+        if rk not in landmarks:
+            continue
+        seen.add(base)
+        d_L = cx - landmarks[k][0]
+        d_R = landmarks[rk][0] - cx
+        if d_L > 2 and d_R > 2:
+            ratios.append(d_L / d_R)
+    if not ratios:
+        return 1.0, 0
+    ratios.sort()
+    return ratios[len(ratios) // 2], len(ratios)
+
+
+def compute_mapped_landmarks(ws_source, ws_target) -> dict:
+    """
+    Compute where ws_source's landmarks would need to be positioned
+    to achieve 100% proportional similarity with ws_target.
+
+    Pipeline:
+      1.  For each face build a coordinate frame:
+            • origin = bilaterally-fair midline centroid (combines
+              singleton midline points and the midpoints of every
+              available bilateral pair, so per-side click error
+              cancels)
+            • axis   = PCA on the same point set, sign-resolved by
+              the chin/brow vote
+            • perp   = axis rotated 90° (image coords), sign-resolved
+              by VOTING across every available _R anchor — robust to
+              individual marginal anchors flipping the frame.
+            • H      = face height reference for normalisation.
+      2.  Express each TARGET landmark in normalised local coords
+          (along, perp) divided by H.
+      3.  Optionally apply a shrunk yaw correction (only when r_s and
+          r_t deviate from 1.0 by more than the noise floor; otherwise
+          treated as 1.0 to avoid amplifying click jitter into fake
+          per-side stretching).
+      4.  Reconstruct mapped position in source's frame:
+              mapped = source_origin + along * H_s * source_axis
+                                     + perp_corr * H_s * source_perp.
+    """
+    lm_s = _effective_landmarks(ws_source)
+    lm_t = _effective_landmarks(ws_target)
+
+    axis_s = _face_axis(lm_s)
+    axis_t = _face_axis(lm_t)
+    if axis_s is None or axis_t is None:
+        return {}
+
+    cs_x, cs_y, ds_x, ds_y = axis_s
+    ct_x, ct_y, dt_x, dt_y = axis_t
+
+    H_s = _ref_length(lm_s)
+    H_t = _ref_length(lm_t)
+    if not H_s or not H_t or H_s < 1 or H_t < 1:
+        return {}
+
+    # Perp candidates: rotate axis 90°. Sign resolved by voting across
+    # ALL right-side anchors (not the first one found).
+    ps_x, ps_y = _resolve_perp_sign(ds_y, -ds_x, lm_s, cs_x, cs_y)
+    pt_x, pt_y = _resolve_perp_sign(dt_y, -dt_x, lm_t, ct_x, ct_y)
+
+    # Yaw foreshortening — shrink toward 1.0 so click jitter on a frontal
+    # face does not produce per-side scaling.
+    r_s_raw, n_s = _bilateral_half_ratio_with_count(lm_s, cs_x)
+    r_t_raw, n_t = _bilateral_half_ratio_with_count(lm_t, ct_x)
+    r_s = _shrink_yaw_ratio(r_s_raw, n_s)
+    r_t = _shrink_yaw_ratio(r_t_raw, n_t)
+    # Hard clamp on extremes.
+    r_s = max(0.5, min(2.0, r_s))
+    r_t = max(0.5, min(2.0, r_t))
+
+    eps = 1e-9
+    scale_left  = math.sqrt(r_s / r_t) if r_t > eps else 1.0
+    scale_right = math.sqrt(r_t / r_s) if r_s > eps else 1.0
+
+    mapped = {}
+    for key, (tx, ty) in lm_t.items():
+        # Express target point in its own normalised local coords.
+        vx = tx - ct_x
+        vy = ty - ct_y
+        along = (vx * dt_x + vy * dt_y) / H_t
+        perp  = (vx * pt_x + vy * pt_y) / H_t
+
+        # Yaw correction (no-op when shrinkage put both r's at 1.0).
+        perp_corrected = perp * (scale_left if perp < 0 else scale_right)
+
+        # Reconstruct in source's frame.
+        mx = cs_x + along * H_s * ds_x + perp_corrected * H_s * ps_x
+        my = cs_y + along * H_s * ds_y + perp_corrected * H_s * ps_y
+
+        mapped[key] = (int(round(mx)), int(round(my)))
+
+    return mapped
 
 
 # ===========================================================================
@@ -1806,7 +2420,7 @@ class CompareSelectDialog(tk.Toplevel):
         ws_b = next(ws for _, ws in self.tabs if ws.name == nb)
         result = run_comparison(ws_a, ws_b)
         self.destroy()
-        CompareResultsWindow(self.master_app, na, nb, result)
+        CompareResultsWindow(self.master_app, na, nb, ws_a, ws_b, result)
 
 
 # ===========================================================================
@@ -1833,8 +2447,12 @@ class CompareResultsWindow(tk.Toplevel):
         if pct < 35:  return "#ff9944"
         return "#ff5544"
 
-    def __init__(self, master, name_a: str, name_b: str, result: dict):
+    def __init__(self, master, name_a: str, name_b: str,
+                 ws_a, ws_b, result: dict):
         super().__init__(master)
+        self.master_app = master
+        self.ws_a, self.ws_b = ws_a, ws_b
+        self.name_a, self.name_b = name_a, name_b
         self.title(f"Comparison  ·  {name_a}  vs  {name_b}")
         self.configure(bg="#0d0d1e")
         self.minsize(820, 600)
@@ -1980,15 +2598,47 @@ class CompareResultsWindow(tk.Toplevel):
         # ── Buttons ───────────────────────────────────────────────────
         btn_row = tk.Frame(self, bg="#0d0d1e", pady=8)
         btn_row.pack(fill="x")
+
         ttk.Button(btn_row, text="Export Report (CSV)",
                    command=lambda: self._export_csv(name_a, name_b, result)
                    ).pack(side="left", padx=12)
+
+        # Separator
+        tk.Frame(btn_row, bg="#222244", width=1).pack(side="left", fill="y", padx=8)
+
+        # Map buttons
+        map_lbl = tk.Label(btn_row, text="Map onto new tab:",
+                           bg="#0d0d1e", fg="#778899", font=("Helvetica", 9))
+        map_lbl.pack(side="left")
+
+        ttk.Button(
+            btn_row,
+            text=f"  {name_a[:14]}  →  {name_b[:14]}  ",
+            command=lambda: self._open_map("a_to_b")
+        ).pack(side="left", padx=4)
+
+        ttk.Button(
+            btn_row,
+            text=f"  {name_b[:14]}  →  {name_a[:14]}  ",
+            command=lambda: self._open_map("b_to_a")
+        ).pack(side="left", padx=4)
+
         ttk.Button(btn_row, text="Close", command=self.destroy).pack(side="right", padx=12)
 
         self.update_idletasks()
         mx = master.winfo_x() + master.winfo_width()  // 2 - self.winfo_width()  // 2
         my = master.winfo_y() + master.winfo_height() // 2 - self.winfo_height() // 2
         self.geometry(f"+{mx}+{my}")
+
+    def _open_map(self, direction: str):
+        """Open a mapping tab in the main app."""
+        if direction == "a_to_b":
+            self.master_app.open_mapping_tab(
+                self.ws_a, self.ws_b, self.name_a, self.name_b)
+        else:
+            self.master_app.open_mapping_tab(
+                self.ws_b, self.ws_a, self.name_b, self.name_a)
+        self.destroy()
 
     def _export_csv(self, name_a, name_b, result):
         path = filedialog.asksaveasfilename(
