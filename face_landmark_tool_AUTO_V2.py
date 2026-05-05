@@ -27,6 +27,12 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+try:
+    import numpy as np
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Landmark definitions
@@ -86,6 +92,89 @@ TOTAL   = len(PROMPTS)
 
 
 # ---------------------------------------------------------------------------
+# MediaPipe Face Mesh index map
+# ---------------------------------------------------------------------------
+# Maps our named landmarks to MediaPipe Face Mesh indices (0-477 with refine).
+#
+# IMPORTANT: This tool uses MONITOR-side L/R convention:
+#   _L = appears on left side of the image  = subject's ANATOMICAL RIGHT
+#   _R = appears on right side of the image = subject's ANATOMICAL LEFT
+#
+# MediaPipe uses subject-anatomical convention internally. Therefore every
+# bilateral entry below is INVERTED relative to MediaPipe's own naming:
+# our "_L" maps to MediaPipe's "right" indices and vice versa.
+#
+# Indices reference: https://github.com/google/mediapipe/blob/master/
+#                    mediapipe/modules/face_geometry/data/canonical_face_model_uv_visualization.png
+
+MEDIAPIPE_INDEX_MAP = {
+    # ── Face outline (jaw silhouette) ─────────────────────────────────
+    # Monitor-left = subject's right side of jaw
+    "face_outline_lip_crease_L": 215,   # subject-right cheek hollow at lip level
+    "face_outline_lip_crease_R": 435,   # subject-left  cheek hollow at lip level
+    "face_under_ear_L":          172,   # subject-right jaw under ear
+    "face_under_ear_R":          397,   # subject-left  jaw under ear
+    "face_above_ear_L":          127,   # subject-right temple (above ear)
+    "face_above_ear_R":          356,   # subject-left  temple (above ear)
+    "cheekbone_outer_L":         234,   # subject-right widest cheek point
+    "cheekbone_outer_R":         454,   # subject-left  widest cheek point
+
+    # ── Brows ─────────────────────────────────────────────────────────
+    "eyebrow_outside_L":         70,    # subject-right brow outer end
+    "eyebrow_outside_R":         300,   # subject-left  brow outer end
+    "eyebrow_inside_L":          55,    # subject-right brow inner end
+    "eyebrow_inside_R":          285,   # subject-left  brow inner end
+    "eyebrow_under_apex_L":      52,    # subject-right brow lower-apex
+    "eyebrow_under_apex_R":      282,   # subject-left  brow lower-apex
+    "eyebrow_upper_apex_L":      105,   # subject-right brow upper-apex
+    "eyebrow_upper_apex_R":      334,   # subject-left  brow upper-apex
+    "glabella":                  9,     # midline between brows
+
+    # ── Eyes ──────────────────────────────────────────────────────────
+    "eye_upper_apex_L":          159,   # subject-right upper eyelid apex
+    "eye_upper_apex_R":          386,   # subject-left  upper eyelid apex
+    "eye_upper_apex_crease_L":   223,   # subject-right upper eyelid crease
+    "eye_upper_apex_crease_R":   443,   # subject-left  upper eyelid crease
+    "eye_outside_corner_L":      33,    # subject-right outer canthus
+    "eye_outside_corner_R":      263,   # subject-left  outer canthus
+    "eye_inside_corner_L":       133,   # subject-right inner canthus
+    "eye_inside_corner_R":       362,   # subject-left  inner canthus
+    "eye_under_apex_L":          145,   # subject-right lower eyelid apex
+    "eye_under_apex_R":          374,   # subject-left  lower eyelid apex
+
+    # ── Nose ──────────────────────────────────────────────────────────
+    "nose_bottom_middle":        2,     # midline below nose tip (columella base)
+    "nose_nostril_outside_L":    98,    # subject-right nostril outer rim
+    "nose_nostril_outside_R":    327,   # subject-left  nostril outer rim
+    "alar_base_L":               209,   # subject-right alar crease (where nose meets cheek)
+    "alar_base_R":               429,   # subject-left  alar crease
+
+    # ── Chin / jaw ────────────────────────────────────────────────────
+    "chin_outer_side_L":         150,   # subject-right chin outer corner
+    "chin_outer_side_R":         379,   # subject-left  chin outer corner
+    "chin_bottom_apex":          152,   # midline chin tip
+
+    # ── Mouth / lips ──────────────────────────────────────────────────
+    "mouth_upper_apex_side_L":   37,    # subject-right upper lip peak
+    "mouth_upper_apex_side_R":   267,   # subject-left  upper lip peak
+    "philtrum_peak_L":           39,    # subject-right cupid's bow peak
+    "philtrum_peak_R":           269,   # subject-left  cupid's bow peak
+    "mouth_upper_low_u":         0,     # midline upper lip valley (cupid's bow center)
+    "lips_center_meet":          13,    # midline where lips meet (inner upper lip)
+    "lips_outer_crease_L":       61,    # subject-right mouth corner
+    "lips_outer_crease_R":       291,   # subject-left  mouth corner
+    "mouth_under_apex_L":        84,    # subject-right lower lip apex
+    "mouth_under_apex_R":        314,   # subject-left  lower lip apex
+    "lip_bottom_center":         17,    # midline bottom of lower lip
+
+    # ── Neck ──────────────────────────────────────────────────────────
+    # MediaPipe's mesh ends at the jawline; neck-face corner has no exact match.
+    # Using the jaw point closest to where neck typically meets face as a fallback.
+    "neck_face_corner_L":        58,    # subject-right jaw near neck
+    "neck_face_corner_R":        288,   # subject-left  jaw near neck
+}
+
+# ---------------------------------------------------------------------------
 # Colours / geometry
 # ---------------------------------------------------------------------------
 
@@ -127,6 +216,7 @@ class Workspace:
     zoom_str:         str   = "Fit"
     scroll_x:         float = 0.0
     scroll_y:         float = 0.0
+    mesh_landmarks:   list  = field(default_factory=list)  # 478 (x,y) from MediaPipe; empty if manual-only
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +374,12 @@ class FaceLandmarkApp(tk.Tk):
                                   command=self.skip_current_point,
                                   state="disabled")
         self.skip_btn.pack(side="right", padx=(0, 8))
+
+        self.auto_btn = tk.Button(pb, text="Auto-Detect", bg="#1a1a40", fg="#44ddaa",
+                                  font=("Helvetica", 9, "bold"), relief="flat",
+                                  padx=10, pady=6, cursor="hand2",
+                                  command=self.auto_detect_landmarks)
+        self.auto_btn.pack(side="right", padx=(0, 4))
 
         # ── Main area ─────────────────────────────────────────────────
         main_frame = ttk.Frame(self)
@@ -1031,6 +1127,7 @@ class FaceLandmarkApp(tk.Tk):
                                     "status": ("estimated" if k in self.ws.estimated_keys
                                                else "placed")}
                                 for k, v in self.ws.landmarks.items()},
+            "mesh_landmarks": [list(p) for p in self.ws.mesh_landmarks],
         }
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
@@ -1077,13 +1174,18 @@ class FaceLandmarkApp(tk.Tk):
 
         ext    = os.path.splitext(path)[1].lower()
         folder = os.path.dirname(path)
+
         try:
-            if   ext == ".json": loaded, hint, skipped, estimated = self._parse_json(path)
-            elif ext == ".csv":  loaded, hint, skipped, estimated = self._parse_csv(path)
+            if ext == ".json":
+                loaded, hint, skipped, estimated, mesh = self._parse_json(path)
+            elif ext == ".csv":
+                loaded, hint, skipped, estimated, mesh = self._parse_csv(path)
             else:
-                messagebox.showerror("Unknown format", "Open a .json or .csv file."); return
+                messagebox.showerror("Unknown format", "Open a .json or .csv file.");
+                return
         except Exception as exc:
-            messagebox.showerror("Parse error", str(exc)); return
+            messagebox.showerror("Parse error", str(exc));
+            return
 
         img_path = self._find_paired_image(folder, path, hint)
         if img_path is None:
@@ -1101,6 +1203,7 @@ class FaceLandmarkApp(tk.Tk):
         self.ws.landmarks      = loaded
         self.ws.skipped_keys   = skipped
         self.ws.estimated_keys = estimated
+        self.ws.mesh_landmarks = mesh
         self.ws.current_step   = TOTAL  # treat loaded file as complete
         self.landmark_listbox.delete(0, tk.END)
         # Re-populate list panel in prompt order
@@ -1151,7 +1254,8 @@ class FaceLandmarkApp(tk.Tk):
         estimated = set(k for k, v in raw.items()
                         if v.get("status") == "estimated")
         estimated |= set(data.get("estimated_keys", []))
-        return loaded, data.get("paired_image"), skipped, estimated
+        mesh = [tuple(p) for p in data.get("mesh_landmarks", [])]
+        return loaded, data.get("paired_image"), skipped, estimated, mesh
 
     def _parse_csv(self, path):
         loaded, hint, skipped, estimated = {}, None, set(), set()
@@ -1172,7 +1276,7 @@ class FaceLandmarkApp(tk.Tk):
                     loaded[row[0]] = (int(row[1]), int(row[2]))
                     if st == "estimated":
                         estimated.add(row[0])
-        return loaded, hint, skipped, estimated
+        return loaded, hint, skipped, estimated, []
 
     # ------------------------------------------------------------------
     # Mouse move
@@ -1249,6 +1353,116 @@ class FaceLandmarkApp(tk.Tk):
             "Ctrl+Scroll       zoom toward cursor\n\n"
             "Requires: Pillow  (pip install Pillow)"
         ))
+
+    # ------------------------------------------------------------------
+    # MediaPipe auto-detection
+    # ------------------------------------------------------------------
+
+    def _get_face_mesh(self):
+        """Lazily initialize the FaceMesh model. Returns None if unavailable."""
+        if not MEDIAPIPE_AVAILABLE:
+            return None
+        if not hasattr(self, "_face_mesh") or self._face_mesh is None:
+            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+            )
+        return self._face_mesh
+
+    def auto_detect_landmarks(self):
+        """Run MediaPipe Face Mesh on the current image and populate all
+        landmarks as estimated. Wipes any existing landmarks first."""
+        if not MEDIAPIPE_AVAILABLE:
+            messagebox.showerror(
+                "MediaPipe not installed",
+                "Auto-detect requires MediaPipe and NumPy.\n\n"
+                "Install with:\n"
+                "  pip install mediapipe numpy"
+            )
+            return
+
+        ws = self.ws
+        if ws.original_image is None:
+            messagebox.showinfo("No image", "Load an image first.")
+            return
+
+        face_mesh = self._get_face_mesh()
+        if face_mesh is None:
+            messagebox.showerror("MediaPipe error", "Could not initialize Face Mesh.")
+            return
+
+        self.status_var.set("Running MediaPipe face detection...")
+        self.update_idletasks()
+
+        try:
+            rgb = np.array(ws.original_image.convert("RGB"))
+            result = face_mesh.process(rgb)
+        except Exception as exc:
+            messagebox.showerror("Detection failed", f"MediaPipe error:\n{exc}")
+            self.status_var.set("Auto-detect failed.")
+            return
+
+        if not result.multi_face_landmarks:
+            messagebox.showwarning(
+                "No face found",
+                "MediaPipe could not detect a face in this image.\n"
+                "Try a clearer frontal image, or place landmarks manually."
+            )
+            self.status_var.set("No face detected.")
+            return
+
+        h, w = rgb.shape[:2]
+        mesh = result.multi_face_landmarks[0].landmark
+        n_mesh = len(mesh)
+
+        # Wipe all existing state (per option A)
+        ws.landmarks.clear()
+        ws.skipped_keys.clear()
+        ws.estimated_keys.clear()
+        ws.mesh_landmarks = []
+        ws.marking_mode = False
+        ws.current_step = TOTAL
+        self.canvas.delete("marker")
+        self.skip_btn.config(state="disabled")
+
+        # Store ALL 478 MediaPipe points (image-space coords) for dense comparison
+        for pt in mesh:
+            mx = int(round(pt.x * w))
+            my = int(round(pt.y * h))
+            mx = max(0, min(mx, w - 1))
+            my = max(0, min(my, h - 1))
+            ws.mesh_landmarks.append((mx, my))
+
+        # Populate the 27 named landmarks as estimated (for the existing 50-metric system)
+        n_placed = 0
+        n_missed = 0
+        for our_key, mesh_idx in MEDIAPIPE_INDEX_MAP.items():
+            if mesh_idx >= n_mesh:
+                n_missed += 1
+                continue
+            x, y = ws.mesh_landmarks[mesh_idx]
+            ws.landmarks[our_key] = (x, y)
+            ws.estimated_keys.add(our_key)
+            n_placed += 1
+
+        self.refresh_display()
+        self._rebuild_list_panel()
+
+        msg = (f"Auto-detected {n_placed} landmarks.\n\n"
+               "All points are marked as estimated (yellow dashed). "
+               "Drag any that look misplaced — dragging promotes them to placed.")
+        if n_missed:
+            msg += f"\n\n{n_missed} mesh indices were out of range (unexpected)."
+
+        self.prompt_var.set(
+            f"  Auto-detected — {n_placed} estimated.  "
+            f"Drag to correct any misplaced points.")
+        self.step_var.set(f"{n_placed} / {TOTAL}  estimated")
+        self.status_var.set(f"Auto-detect complete: {n_placed} landmarks placed as estimated.")
+
+        messagebox.showinfo("Auto-detect complete", msg)
 
     # ------------------------------------------------------------------
     # Mapping tab  (opens a new tab showing original + 100%-target overlay)
@@ -1776,6 +1990,113 @@ def compute_mapped_landmarks(ws_source, ws_target) -> dict:
 
 
 # ===========================================================================
+# Dense mesh comparison  (auto-vs-auto only, all 478 points)
+# ===========================================================================
+
+# Empirical threshold: average per-point face-normalized distance at which
+# two faces are considered "completely different." Below this maps linearly
+# to a 0-100 score. Tune this if scores cluster too high or too low.
+_MESH_DIFF_FLOOR = 0.05   # 5% of face height = score 0
+
+
+def _normalize_mesh_to_canonical_frame(mesh: list, named_lm: dict):
+    """
+    Transform all mesh points into a canonical face-local frame:
+      • origin = midline centroid (computed from named landmarks via _face_axis)
+      • along-axis = face axis (chin direction = positive along)
+      • perp-axis = perpendicular, sign-resolved by _resolve_perp_sign
+      • unit = face height (from _ref_length)
+
+    Returns:
+      list of (along_norm, perp_norm) tuples in the canonical frame, or
+      None if the face axis or reference length couldn't be computed.
+
+    Note: uses the named landmarks (which already passed through MediaPipe's
+    detection on auto-detected workspaces) to define the frame, then
+    transforms ALL mesh points into that frame.
+    """
+    axis = _face_axis(named_lm)
+    if axis is None:
+        return None
+
+    cx, cy, dx, dy = axis
+    H = _ref_length(named_lm)
+    if H is None or H < 1:
+        return None
+
+    # Resolve perp sign once, using the named-landmark _R anchors
+    px, py = _resolve_perp_sign(dy, -dx, named_lm, cx, cy)
+
+    normalized = []
+    for (mx, my) in mesh:
+        vx = mx - cx
+        vy = my - cy
+        along = (vx * dx + vy * dy) / H
+        perp  = (vx * px + vy * py) / H
+        normalized.append((along, perp))
+    return normalized
+
+
+def compute_mesh_comparison(ws_a, ws_b) -> Optional[dict]:
+    """
+    Dense point-by-point comparison of two faces using their full
+    478-point MediaPipe meshes.
+
+    Returns None if either workspace lacks mesh data, or if the
+    canonical frame can't be built. Otherwise returns:
+      {
+        "score":         float (0-100, higher = more similar),
+        "mean_dist":     float (mean per-point distance, face-height units),
+        "median_dist":   float (median per-point distance),
+        "max_dist":      float (worst single point),
+        "n_points":      int (how many points compared),
+      }
+    """
+    if not ws_a.mesh_landmarks or not ws_b.mesh_landmarks:
+        return None
+    if len(ws_a.mesh_landmarks) != len(ws_b.mesh_landmarks):
+        # Shouldn't happen with same MediaPipe version, but guard anyway
+        return None
+
+    # Use the EFFECTIVE named landmarks to build each canonical frame.
+    # This way, even partially-skipped manual workspaces could feed in,
+    # but in practice this function is called only when both have mesh data.
+    lm_a = _effective_landmarks(ws_a)
+    lm_b = _effective_landmarks(ws_b)
+
+    norm_a = _normalize_mesh_to_canonical_frame(ws_a.mesh_landmarks, lm_a)
+    norm_b = _normalize_mesh_to_canonical_frame(ws_b.mesh_landmarks, lm_b)
+    if norm_a is None or norm_b is None:
+        return None
+
+    # Per-point Euclidean distance in canonical (along, perp) units
+    distances = []
+    for (a_al, a_pe), (b_al, b_pe) in zip(norm_a, norm_b):
+        d = math.sqrt((a_al - b_al) ** 2 + (a_pe - b_pe) ** 2)
+        distances.append(d)
+
+    if not distances:
+        return None
+
+    distances.sort()
+    n = len(distances)
+    mean_d   = sum(distances) / n
+    median_d = distances[n // 2]
+    max_d    = distances[-1]
+
+    # Linear map: 0.0 → 100, _MESH_DIFF_FLOOR → 0
+    score = max(0.0, min(100.0,
+                         100.0 * (1.0 - mean_d / _MESH_DIFF_FLOOR)))
+
+    return {
+        "score":       score,
+        "mean_dist":   mean_d,
+        "median_dist": median_d,
+        "max_dist":    max_d,
+        "n_points":    n,
+    }
+
+# ===========================================================================
 # Proportional comparison engine
 # ===========================================================================
 
@@ -2165,11 +2486,15 @@ def run_comparison(ws_a, ws_b) -> dict:
 
     overall = max(0.0, 100.0 - weighted_sum/weight_total) if weight_total > 0 else 0.0
 
+    # Optionally compute dense mesh comparison if both sides have mesh data
+    mesh_result = compute_mesh_comparison(ws_a, ws_b)
+
     return {
-        "metrics":    rows,
+        "metrics": rows,
         "cat_scores": cat_scores,
-        "score":      overall,
-        "missing":    missing,
+        "score": overall,
+        "missing": missing,
+        "mesh": mesh_result,  # None unless both workspaces auto-detected
     }
 
 
@@ -2266,13 +2591,49 @@ class CompareResultsWindow(tk.Toplevel):
         # ── Overall score header ──────────────────────────────────────
         hdr = tk.Frame(self, bg="#0f3460", pady=10)
         hdr.pack(fill="x")
-        tk.Label(hdr, text="Overall Similarity Score", bg="#0f3460", fg="#8899bb",
-                 font=("Helvetica", 10)).pack()
-        tk.Label(hdr, text=f"{score:.1f} / 100",
-                 bg="#0f3460", fg=self._score_color(score),
-                 font=("Helvetica", 36, "bold")).pack()
+
+        # Two-column header when mesh score is available
+        mesh_data = result.get("mesh")
+        if mesh_data is not None:
+            cols = tk.Frame(hdr, bg="#0f3460")
+            cols.pack()
+
+            # Left column: 50-metric score
+            left = tk.Frame(cols, bg="#0f3460", padx=20)
+            left.pack(side="left")
+            tk.Label(left, text="50-Metric Score", bg="#0f3460", fg="#8899bb",
+                     font=("Helvetica", 9)).pack()
+            tk.Label(left, text=f"{score:.1f} / 100",
+                     bg="#0f3460", fg=self._score_color(score),
+                     font=("Helvetica", 28, "bold")).pack()
+            tk.Label(left, text="proportional anatomy",
+                     bg="#0f3460", fg="#667799", font=("Helvetica", 8)).pack()
+
+            # Divider
+            tk.Frame(cols, bg="#22335a", width=1, height=80).pack(side="left", fill="y")
+
+            # Right column: dense mesh score
+            right = tk.Frame(cols, bg="#0f3460", padx=20)
+            right.pack(side="left")
+            mesh_score = mesh_data["score"]
+            tk.Label(right, text="Dense Mesh Score", bg="#0f3460", fg="#8899bb",
+                     font=("Helvetica", 9)).pack()
+            tk.Label(right, text=f"{mesh_score:.1f} / 100",
+                     bg="#0f3460", fg=self._score_color(mesh_score),
+                     font=("Helvetica", 28, "bold")).pack()
+            tk.Label(right,
+                     text=f"{mesh_data['n_points']} points · "
+                          f"avg {mesh_data['mean_dist'] * 100:.2f}% face-height",
+                     bg="#0f3460", fg="#667799", font=("Helvetica", 8)).pack()
+        else:
+            tk.Label(hdr, text="Overall Similarity Score", bg="#0f3460", fg="#8899bb",
+                     font=("Helvetica", 10)).pack()
+            tk.Label(hdr, text=f"{score:.1f} / 100",
+                     bg="#0f3460", fg=self._score_color(score),
+                     font=("Helvetica", 36, "bold")).pack()
+
         tk.Label(hdr, text=f"{name_a}   vs   {name_b}",
-                 bg="#0f3460", fg="#778899", font=("Helvetica", 10)).pack()
+                 bg="#0f3460", fg="#778899", font=("Helvetica", 10)).pack(pady=(8, 0))
 
         # ── Category sub-score bars ───────────────────────────────────
         cat_frame = tk.Frame(self, bg="#111130", pady=8)
