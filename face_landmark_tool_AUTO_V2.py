@@ -2740,6 +2740,87 @@ def average_named_landmarks_canonical(ws_list: list) -> dict:
     return averaged
 
 # ===========================================================================
+# Folder-loaded comparison sources
+# ===========================================================================
+
+def _scan_folder_for_landmark_jsons(root_folder: str, max_depth: int = 2) -> list:
+    """
+    Walk root_folder up to max_depth levels deep (folder itself = depth 1,
+    direct subfolders = depth 2) and return absolute paths to every .json
+    file that parses as a valid landmark export.
+
+    A "valid" landmark JSON has at minimum a 'landmarks' dict.
+    """
+    found = []
+    root_folder = os.path.abspath(root_folder)
+    if not os.path.isdir(root_folder):
+        return found
+
+    # Walk with depth tracking
+    for current_dir, subdirs, files in os.walk(root_folder):
+        rel = os.path.relpath(current_dir, root_folder)
+        depth = 1 if rel == "." else 1 + rel.count(os.sep) + 1
+        if depth > max_depth:
+            # Prune deeper traversal
+            subdirs[:] = []
+            continue
+
+        for fname in files:
+            if not fname.lower().endswith(".json"):
+                continue
+            full = os.path.join(current_dir, fname)
+            try:
+                with open(full, "r") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get("landmarks"), dict):
+                    found.append(full)
+            except Exception:
+                # Silently skip unreadable / non-landmark JSONs
+                continue
+
+    return found
+
+
+def _build_workspace_from_json(json_path: str) -> Optional[Workspace]:
+    """
+    Build a lightweight throwaway Workspace from a landmark JSON file.
+    No image is loaded — these workspaces exist only for comparison
+    (proportions + mesh), never for visualization or mapping target.
+    Returns None if the JSON can't be parsed as a landmark file.
+    """
+    try:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+
+    raw = data.get("landmarks")
+    if not isinstance(raw, dict):
+        return None
+
+    landmarks = {k: (v["x"], v["y"]) for k, v in raw.items()
+                 if isinstance(v, dict) and v.get("x") is not None}
+    if not landmarks:
+        return None
+
+    skipped = set(data.get("skipped_keys", []))
+    estimated = set(k for k, v in raw.items()
+                    if isinstance(v, dict) and v.get("status") == "estimated")
+    estimated |= set(data.get("estimated_keys", []))
+    mesh = [tuple(p) for p in data.get("mesh_landmarks", [])]
+
+    ws = Workspace()
+    ws.name = os.path.splitext(os.path.basename(json_path))[0][:32]
+    ws.original_image = None  # never displayed
+    ws.image_stem = os.path.splitext(os.path.basename(json_path))[0]
+    ws.landmarks = landmarks
+    ws.skipped_keys = skipped
+    ws.estimated_keys = estimated
+    ws.mesh_landmarks = mesh
+    ws.current_step = TOTAL
+    return ws
+
+# ===========================================================================
 # Tab-selection dialog
 # ===========================================================================
 
@@ -2748,63 +2829,63 @@ class CompareSelectDialog(tk.Toplevel):
     def __init__(self, master: FaceLandmarkApp, tabs: list):
         super().__init__(master)
         self.master_app = master
-        self.tabs = tabs   # list of (idx, ws)
+        self.tabs = tabs   # list of (idx, ws) — workspace tabs
         self.title("Select Tabs to Compare")
         self.resizable(False, False)
         self.configure(bg="#1a1a2e")
         self.grab_set()
 
+        # Folder-loaded entries: per side, list of dicts
+        # Each dict: {"folder": path, "workspaces": [Workspace, ...], "var": BooleanVar}
+        self.folders_a: list = []
+        self.folders_b: list = []
+
         intro = tk.Label(
             self,
-            text="Select tabs for each group. Either side can have multiple tabs.\n"
-                 "When a side has multiple tabs, its measurements are averaged.",
+            text="Select tabs for each group, or load a folder of landmark JSONs.\n"
+                 "When a side has multiple sources, its measurements are averaged.",
             bg="#1a1a2e", fg="#aaaaaa", font=("Helvetica", 9),
             justify="left", padx=14)
         intro.grid(row=0, column=0, columnspan=2, sticky="w", pady=(12, 8))
 
-        # Two columns of checkboxes
+        # Group headers
         tk.Label(self, text="Group A", bg="#1a1a2e", fg="#00d4ff",
                  font=("Helvetica", 10, "bold")
-                 ).grid(row=1, column=0, padx=14, pady=(4, 4), sticky="w")
+                 ).grid(row=1, column=0, padx=14, sticky="w")
         tk.Label(self, text="Group B", bg="#1a1a2e", fg="#ff6b35",
                  font=("Helvetica", 10, "bold")
-                 ).grid(row=1, column=1, padx=14, pady=(4, 4), sticky="w")
+                 ).grid(row=1, column=1, padx=14, sticky="w")
 
-        list_a_frame = tk.Frame(self, bg="#0d0d1a", padx=4, pady=4)
-        list_a_frame.grid(row=2, column=0, padx=14, pady=4, sticky="nsew")
-        list_b_frame = tk.Frame(self, bg="#0d0d1a", padx=4, pady=4)
-        list_b_frame.grid(row=2, column=1, padx=14, pady=4, sticky="nsew")
+        # Add Folder buttons
+        ttk.Button(self, text="+ Add Folder...",
+                   command=lambda: self._add_folder("A")
+                   ).grid(row=2, column=0, padx=14, pady=(2, 4), sticky="w")
+        ttk.Button(self, text="+ Add Folder...",
+                   command=lambda: self._add_folder("B")
+                   ).grid(row=2, column=1, padx=14, pady=(2, 4), sticky="w")
 
-        # Build per-tab variables
+        # List frames (scrollable in case of many folders/tabs)
+        list_a_outer = tk.Frame(self, bg="#0d0d1a", padx=4, pady=4,
+                                width=320, height=280)
+        list_a_outer.grid(row=3, column=0, padx=14, pady=4, sticky="nsew")
+        list_a_outer.grid_propagate(False)
+        list_b_outer = tk.Frame(self, bg="#0d0d1a", padx=4, pady=4,
+                                width=320, height=280)
+        list_b_outer.grid(row=3, column=1, padx=14, pady=4, sticky="nsew")
+        list_b_outer.grid_propagate(False)
+
+        # Inner content frames (rebuilt by _refresh_lists)
+        self.list_a_frame = list_a_outer
+        self.list_b_frame = list_b_outer
+        self._a_widgets: list = []
+        self._b_widgets: list = []
+
+        # Per-tab variables (parallel to self.tabs)
         self.vars_a: list[tk.BooleanVar] = []
         self.vars_b: list[tk.BooleanVar] = []
-        self.tab_names: list[str] = [ws.name for _, ws in tabs]
-        self.checks_a: list[tk.Checkbutton] = []
-        self.checks_b: list[tk.Checkbutton] = []
-
-        for i, name in enumerate(self.tab_names):
-            va = tk.BooleanVar(value=False)
-            vb = tk.BooleanVar(value=False)
-            self.vars_a.append(va)
-            self.vars_b.append(vb)
-
-            ca = tk.Checkbutton(
-                list_a_frame, text=name, variable=va,
-                bg="#0d0d1a", fg="#cccccc", selectcolor="#0f3460",
-                activebackground="#0d0d1a", activeforeground="#ffffff",
-                font=("Helvetica", 9), anchor="w", padx=4, pady=2,
-                command=lambda idx=i: self._on_check_a(idx))
-            ca.pack(fill="x", anchor="w")
-            self.checks_a.append(ca)
-
-            cb = tk.Checkbutton(
-                list_b_frame, text=name, variable=vb,
-                bg="#0d0d1a", fg="#cccccc", selectcolor="#0f3460",
-                activebackground="#0d0d1a", activeforeground="#ffffff",
-                font=("Helvetica", 9), anchor="w", padx=4, pady=2,
-                command=lambda idx=i: self._on_check_b(idx))
-            cb.pack(fill="x", anchor="w")
-            self.checks_b.append(cb)
+        for _ in tabs:
+            self.vars_a.append(tk.BooleanVar(value=False))
+            self.vars_b.append(tk.BooleanVar(value=False))
 
         # Default: first tab in A, second in B (matches previous behavior)
         if len(self.vars_a) >= 1:
@@ -2818,15 +2899,16 @@ class CompareSelectDialog(tk.Toplevel):
         self.hint_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self.hint_var, bg="#1a1a2e", fg="#888888",
                  font=("Helvetica", 9), padx=14
-                 ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+                 ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # Buttons
         bf = tk.Frame(self, bg="#1a1a2e")
-        bf.grid(row=4, column=0, columnspan=2, pady=14)
+        bf.grid(row=5, column=0, columnspan=2, pady=14)
         self.compare_button = ttk.Button(bf, text="Compare", command=self._go)
         self.compare_button.pack(side="left", padx=6)
         ttk.Button(bf, text="Cancel", command=self.destroy).pack(side="left", padx=6)
 
+        self._refresh_lists()
         self._refresh_state()
 
         self.update_idletasks()
@@ -2834,55 +2916,209 @@ class CompareSelectDialog(tk.Toplevel):
         y = master.winfo_y() + master.winfo_height() // 2 - self.winfo_height() // 2
         self.geometry(f"+{x}+{y}")
 
-    def _on_check_a(self, idx: int):
-        # If checked in A and also in B, uncheck in B (no double-counting)
-        if self.vars_a[idx].get() and self.vars_b[idx].get():
-            self.vars_b[idx].set(False)
+    # -- folder loading -----------------------------------------------
+
+    def _add_folder(self, side: str):
+        folder = filedialog.askdirectory(
+            title=f"Select folder of landmark JSONs for Group {side}",
+            parent=self)
+        if not folder:
+            return
+
+        # Avoid duplicate folder add
+        existing = self.folders_a if side == "A" else self.folders_b
+        for entry in existing:
+            if os.path.normpath(entry["folder"]) == os.path.normpath(folder):
+                messagebox.showinfo(
+                    "Already added",
+                    f"That folder is already added to Group {side}.",
+                    parent=self)
+                return
+
+        json_paths = _scan_folder_for_landmark_jsons(folder, max_depth=2)
+        if not json_paths:
+            messagebox.showwarning(
+                "No landmark JSONs found",
+                f"Searched {os.path.basename(folder)} (depth 2) and found no\n"
+                "valid landmark JSON files.",
+                parent=self)
+            return
+
+        # Build throwaway workspaces (no images)
+        loaded_ws = []
+        bad = 0
+        for p in json_paths:
+            ws = _build_workspace_from_json(p)
+            if ws is not None:
+                loaded_ws.append(ws)
+            else:
+                bad += 1
+
+        if not loaded_ws:
+            messagebox.showwarning(
+                "All files failed to parse",
+                f"Found {len(json_paths)} JSON file(s) but none parsed as\n"
+                "valid landmark exports.",
+                parent=self)
+            return
+
+        entry = {
+            "folder": folder,
+            "workspaces": loaded_ws,
+            "var": tk.BooleanVar(value=True),  # default on when first added
+            "n_with_mesh": sum(1 for w in loaded_ws if w.mesh_landmarks),
+        }
+        if side == "A":
+            self.folders_a.append(entry)
+        else:
+            self.folders_b.append(entry)
+
+        self._refresh_lists()
         self._refresh_state()
 
-    def _on_check_b(self, idx: int):
-        if self.vars_b[idx].get() and self.vars_a[idx].get():
+    def _remove_folder(self, side: str, idx: int):
+        target = self.folders_a if side == "A" else self.folders_b
+        if 0 <= idx < len(target):
+            target.pop(idx)
+            self._refresh_lists()
+            self._refresh_state()
+
+    # -- list rendering ----------------------------------------------
+
+    def _refresh_lists(self):
+        # Clear existing widgets
+        for w in self._a_widgets:
+            w.destroy()
+        for w in self._b_widgets:
+            w.destroy()
+        self._a_widgets.clear()
+        self._b_widgets.clear()
+
+        # Render side A
+        self._render_side(
+            self.list_a_frame, self._a_widgets,
+            self.tabs, self.vars_a, self.folders_a, "A")
+        # Render side B
+        self._render_side(
+            self.list_b_frame, self._b_widgets,
+            self.tabs, self.vars_b, self.folders_b, "B")
+
+    def _render_side(self, parent_frame, widget_list,
+                     tabs, tab_vars, folders, side):
+        # Tab checkboxes
+        for i, (_, ws) in enumerate(tabs):
+            cb = tk.Checkbutton(
+                parent_frame, text=ws.name, variable=tab_vars[i],
+                bg="#0d0d1a", fg="#cccccc", selectcolor="#0f3460",
+                activebackground="#0d0d1a", activeforeground="#ffffff",
+                font=("Helvetica", 9), anchor="w", padx=4, pady=2,
+                command=lambda idx=i, s=side: self._on_tab_check(s, idx))
+            cb.pack(fill="x", anchor="w")
+            widget_list.append(cb)
+
+        # Separator if both tabs and folders exist
+        if tabs and folders:
+            sep = tk.Frame(parent_frame, bg="#22335a", height=1)
+            sep.pack(fill="x", padx=4, pady=4)
+            widget_list.append(sep)
+
+        # Folder entries — one row per folder, with a checkbox + remove (×)
+        for fi, entry in enumerate(folders):
+            row = tk.Frame(parent_frame, bg="#0d0d1a")
+            row.pack(fill="x", anchor="w")
+
+            n = len(entry["workspaces"])
+            n_mesh = entry["n_with_mesh"]
+            folder_name = os.path.basename(entry["folder"]) or entry["folder"]
+            label = f"📁 {folder_name}  ({n} files"
+            if n_mesh < n:
+                label += f", {n_mesh} w/ mesh"
+            label += ")"
+
+            cb = tk.Checkbutton(
+                row, text=label, variable=entry["var"],
+                bg="#0d0d1a", fg="#a8ff3e", selectcolor="#0f3460",
+                activebackground="#0d0d1a", activeforeground="#ffffff",
+                font=("Helvetica", 9), anchor="w", padx=4, pady=2,
+                command=self._refresh_state)
+            cb.pack(side="left", fill="x", expand=True)
+
+            close_btn = tk.Label(
+                row, text=" × ", bg="#0d0d1a", fg="#666666",
+                font=("Helvetica", 10, "bold"), cursor="hand2", padx=6)
+            close_btn.pack(side="right")
+            close_btn.bind(
+                "<Button-1>",
+                lambda _e, s=side, idx=fi: self._remove_folder(s, idx))
+            close_btn.bind("<Enter>", lambda _e, b=close_btn: b.config(fg="#ff4455"))
+            close_btn.bind("<Leave>", lambda _e, b=close_btn: b.config(fg="#666666"))
+
+            widget_list.append(row)
+
+    # -- check handling -----------------------------------------------
+
+    def _on_tab_check(self, side: str, idx: int):
+        # If a tab is checked on both sides, uncheck the other side (no double-counting)
+        if side == "A" and self.vars_a[idx].get() and self.vars_b[idx].get():
+            self.vars_b[idx].set(False)
+        elif side == "B" and self.vars_b[idx].get() and self.vars_a[idx].get():
             self.vars_a[idx].set(False)
         self._refresh_state()
 
     def _refresh_state(self):
-        n_a = sum(1 for v in self.vars_a if v.get())
-        n_b = sum(1 for v in self.vars_b if v.get())
+        ws_list_a = self._collect_side("A")
+        ws_list_b = self._collect_side("B")
+        n_a = len(ws_list_a)
+        n_b = len(ws_list_b)
         valid = n_a >= 1 and n_b >= 1
 
         if not valid:
-            self.hint_var.set("  Select at least one tab in each group.")
+            self.hint_var.set("  Select at least one source on each side.")
         else:
-            parts = []
-            if n_a == 1:
-                parts.append("Group A: 1 tab")
-            else:
-                parts.append(f"Group A: {n_a} tabs (averaged)")
-            if n_b == 1:
-                parts.append("Group B: 1 tab")
-            else:
-                parts.append(f"Group B: {n_b} tabs (averaged)")
-            self.hint_var.set("  " + "   ·   ".join(parts))
+            def desc(n, side):
+                if n == 1:
+                    return f"Group {side}: 1 source"
+                return f"Group {side}: {n} sources (averaged)"
+            self.hint_var.set("  " + desc(n_a, "A") + "   ·   " + desc(n_b, "B"))
 
         if valid:
             self.compare_button.state(["!disabled"])
         else:
             self.compare_button.state(["disabled"])
 
-    def _selected_workspaces(self, vars_list) -> list:
+    # -- collection ---------------------------------------------------
+
+    def _collect_side(self, side: str) -> list:
         result = []
-        for i, v in enumerate(vars_list):
+        if side == "A":
+            tab_vars = self.vars_a
+            folders = self.folders_a
+        else:
+            tab_vars = self.vars_b
+            folders = self.folders_b
+
+        # Tab workspaces
+        for i, v in enumerate(tab_vars):
             if v.get():
-                result.append(self.tabs[i][1])  # workspace, not (idx, ws)
+                result.append(self.tabs[i][1])
+
+        # Folder workspaces (only if folder is checked)
+        for entry in folders:
+            if entry["var"].get():
+                result.extend(entry["workspaces"])
+
         return result
 
+    # -- go -----------------------------------------------------------
+
     def _go(self):
-        ws_list_a = self._selected_workspaces(self.vars_a)
-        ws_list_b = self._selected_workspaces(self.vars_b)
+        ws_list_a = self._collect_side("A")
+        ws_list_b = self._collect_side("B")
         if not ws_list_a or not ws_list_b:
-            messagebox.showwarning("Selection",
-                                   "Each group needs at least one tab.",
-                                   parent=self)
+            messagebox.showwarning(
+                "Selection",
+                "Each group needs at least one source.",
+                parent=self)
             return
 
         result = run_group_comparison(ws_list_a, ws_list_b)
@@ -3139,11 +3375,11 @@ class CompareResultsWindow(tk.Toplevel):
                    command=lambda: self._export_csv(self.name_a, self.name_b, result)
                    ).pack(side="left", padx=12)
 
-        # Map buttons — ONLY when one side is exactly 1 tab.
-        # The solo side is the target image; the other side (group or 1-tab)
-        # provides the proportions to map onto it.
-        solo_a = (n_a == 1)
-        solo_b = (n_b == 1)
+        # Map buttons — ONLY when one side is exactly 1 source AND that source
+        # has an image (folder-loaded sources have no image, so they can't be
+        # the mapping target).
+        solo_a = (n_a == 1) and (ws_list_a[0].original_image is not None)
+        solo_b = (n_b == 1) and (ws_list_b[0].original_image is not None)
 
         if solo_a or solo_b:
             tk.Frame(btn_row, bg="#222244", width=1).pack(side="left", fill="y", padx=8)
