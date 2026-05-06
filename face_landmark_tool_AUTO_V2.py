@@ -1509,6 +1509,46 @@ class FaceLandmarkApp(tk.Tk):
         self.active_idx = len(self.workspaces) - 1
         self._restore_workspace(self.active_idx)
 
+    def open_mapping_tab_from_canonical(self, ws_solo, target_canonical: dict,
+                                        source_name: str, target_name: str):
+        """
+        Create a mapping tab where the diamond targets are derived from
+        averaged canonical-frame positions (used for group → solo mapping).
+        ws_solo is the workspace whose image will be displayed.
+        """
+        if ws_solo.original_image is None:
+            messagebox.showerror("No image", f"'{target_name}' has no image.")
+            return
+
+        mapped = compute_mapped_landmarks_from_proportions(ws_solo, None,
+                                                           target_canonical)
+        if not mapped:
+            messagebox.showerror(
+                "Cannot map",
+                "Not enough landmarks to compute the mapping."
+            )
+            return
+
+        self._snapshot_current()
+
+        new_ws = Workspace()
+        new_ws.name = f"Map: {source_name} → {target_name}"
+        new_ws.original_image = ws_solo.original_image.copy()
+        new_ws.image_stem = f"map_{source_name}_to_{target_name}".replace(" ", "_")
+        new_ws.landmarks = dict(ws_solo.landmarks)
+        new_ws.skipped_keys = set(ws_solo.skipped_keys)
+        new_ws.estimated_keys = set(ws_solo.estimated_keys)
+        new_ws.mapped_landmarks = mapped
+        new_ws.mapped_label = f"{source_name} → {target_name}"
+        new_ws.zoom_str = "Fit"
+        new_ws.scale_factor = 1.0
+        new_ws.marking_mode = False
+        new_ws.current_step = TOTAL
+
+        self.workspaces.append(new_ws)
+        self.active_idx = len(self.workspaces) - 1
+        self._restore_workspace(self.active_idx)
+
     # ------------------------------------------------------------------
     # Compare
     # ------------------------------------------------------------------
@@ -2422,21 +2462,120 @@ def compute_proportions(landmarks: dict) -> dict[str, float]:
     return result
 
 
-def run_comparison(ws_a, ws_b) -> dict:
+def _average_proportions(ws_list: list) -> dict:
     """
-    Full comparison between two workspaces.
-    Uses _effective_landmarks so skipped/missing points are filled in
-    by mirroring + estimation before metrics are computed.
-    Returns:
-      metrics     : list of (name, cat, weight, val_a, val_b, pct_diff)
-      cat_scores  : {category: score_0_to_100}
-      score       : float 0-100 overall weighted score
-      missing     : [name, ...]
+    Average the 50-metric proportional values across a group of workspaces.
+    For each metric, runs compute_proportions on each member's effective
+    landmarks, then averages the metric across all members that produced
+    a value (skipping members where the metric was None).
+
+    Returns the same shape as compute_proportions: {metric_name: avg_value}.
     """
-    lm_a = _effective_landmarks(ws_a)
-    lm_b = _effective_landmarks(ws_b)
-    pa   = compute_proportions(lm_a)
-    pb   = compute_proportions(lm_b)
+    per_member = []
+    for ws in ws_list:
+        lm = _effective_landmarks(ws)
+        per_member.append(compute_proportions(lm))
+
+    averaged = {}
+    for name, _cat, _w, _fn in METRIC_DEFS:
+        vals = [d[name] for d in per_member if name in d]
+        if vals:
+            averaged[name] = sum(vals) / len(vals)
+    return averaged
+
+
+def _average_mesh_canonical(ws_list: list):
+    """
+    Compute the per-point average of a group's meshes in canonical face frame.
+    All-or-nothing: returns None if ANY workspace lacks mesh data.
+
+    Each workspace's mesh is transformed into its own canonical frame, then
+    we average position-by-position across all members. Result is a list of
+    (along, perp) tuples in canonical units (face-height-normalized).
+    """
+    if not ws_list:
+        return None
+    # All-or-nothing check
+    for ws in ws_list:
+        if not ws.mesh_landmarks:
+            return None
+
+    # Verify all meshes have the same length
+    n_points = len(ws_list[0].mesh_landmarks)
+    for ws in ws_list[1:]:
+        if len(ws.mesh_landmarks) != n_points:
+            return None
+
+    # Normalize each mesh to canonical frame
+    normalized_per_member = []
+    for ws in ws_list:
+        lm = _effective_landmarks(ws)
+        norm = _normalize_mesh_to_canonical_frame(ws.mesh_landmarks, lm)
+        if norm is None:
+            return None
+        normalized_per_member.append(norm)
+
+    # Per-point average
+    n_members = len(normalized_per_member)
+    averaged = []
+    for i in range(n_points):
+        sum_along = sum(normalized_per_member[m][i][0] for m in range(n_members))
+        sum_perp  = sum(normalized_per_member[m][i][1] for m in range(n_members))
+        averaged.append((sum_along / n_members, sum_perp / n_members))
+    return averaged
+
+
+def compute_mesh_comparison_canonical(canon_a: list, canon_b: list) -> Optional[dict]:
+    """
+    Dense mesh comparison given two ALREADY-canonicalized meshes (lists of
+    (along, perp) tuples). Mirrors compute_mesh_comparison's output but
+    skips the canonicalization step (already done upstream for groups).
+    """
+    if canon_a is None or canon_b is None:
+        return None
+    if len(canon_a) != len(canon_b):
+        return None
+
+    distances = []
+    for (a_al, a_pe), (b_al, b_pe) in zip(canon_a, canon_b):
+        d = math.sqrt((a_al - b_al) ** 2 + (a_pe - b_pe) ** 2)
+        distances.append(d)
+
+    if not distances:
+        return None
+
+    distances.sort()
+    n = len(distances)
+    mean_d   = sum(distances) / n
+    median_d = distances[n // 2]
+    max_d    = distances[-1]
+
+    score = max(0.0, min(100.0, 100.0 * (1.0 - mean_d / _MESH_DIFF_FLOOR)))
+
+    return {
+        "score":       score,
+        "mean_dist":   mean_d,
+        "median_dist": median_d,
+        "max_dist":    max_d,
+        "n_points":    n,
+    }
+
+
+def run_group_comparison(ws_list_a: list, ws_list_b: list) -> dict:
+    """
+    Generalized comparison between two groups of workspaces.
+    When both groups are length 1, behaves identically to a 1-vs-1 compare.
+    When either is multi, that side's metrics are averaged across members.
+
+    Returns the standard result dict plus:
+      group_a_size, group_b_size — int counts
+      group_a_names, group_b_names — list of tab names
+      avg_proportions_a, avg_proportions_b — the averaged metric dicts
+        (used by group→solo mapping)
+    """
+    # Per-side proportions (averaged if multi, single if length 1)
+    pa = _average_proportions(ws_list_a)
+    pb = _average_proportions(ws_list_b)
 
     rows    = []
     missing = []
@@ -2450,11 +2589,9 @@ def run_comparison(ws_a, ws_b) -> dict:
             continue
 
         if cat == CAT_ANGULAR:
-            # Angular: absolute difference in degrees (max ~180)
             diff_deg = abs(va - vb)
             pct = (diff_deg / 180.0) * 100
         elif cat == CAT_SYMMETRY:
-            # Symmetry ratios: compare both faces' L/R ratios as %
             avg = (abs(va) + abs(vb)) / 2
             pct = abs(va - vb) / avg * 100 if avg > 1e-9 else 0.0
         else:
@@ -2463,7 +2600,7 @@ def run_comparison(ws_a, ws_b) -> dict:
 
         rows.append((name, cat, weight, va, vb, pct))
 
-    # ── Category sub-scores ──────────────────────────────────────────
+    # Category sub-scores
     cat_data: dict[str, list] = {c: [] for c in CATEGORY_META}
     for name, cat, weight, va, vb, pct in rows:
         if pct is not None:
@@ -2472,31 +2609,135 @@ def run_comparison(ws_a, ws_b) -> dict:
     cat_scores = {}
     for cat, vals in cat_data.items():
         if vals:
-            cat_scores[cat] = max(0.0, 100.0 - sum(vals)/len(vals))
+            cat_scores[cat] = max(0.0, 100.0 - sum(vals) / len(vals))
         else:
             cat_scores[cat] = None
 
-    # ── Overall weighted score ────────────────────────────────────────
+    # Overall weighted score
     weighted_sum, weight_total = 0.0, 0.0
     for name, cat, weight, va, vb, pct in rows:
         if pct is not None:
             cat_w = CATEGORY_META[cat]["weight"]
-            weighted_sum  += pct * weight * cat_w
-            weight_total  += weight * cat_w
+            weighted_sum += pct * weight * cat_w
+            weight_total += weight * cat_w
 
-    overall = max(0.0, 100.0 - weighted_sum/weight_total) if weight_total > 0 else 0.0
+    overall = max(0.0, 100.0 - weighted_sum / weight_total) if weight_total > 0 else 0.0
 
-    # Optionally compute dense mesh comparison if both sides have mesh data
-    mesh_result = compute_mesh_comparison(ws_a, ws_b)
+    # Dense mesh comparison — uses canonical-space averaging for groups.
+    # All-or-nothing: if ANY tab in either group lacks mesh data, mesh is None.
+    canon_a = _average_mesh_canonical(ws_list_a)
+    canon_b = _average_mesh_canonical(ws_list_b)
+    mesh_result = compute_mesh_comparison_canonical(canon_a, canon_b)
 
     return {
-        "metrics": rows,
-        "cat_scores": cat_scores,
-        "score": overall,
-        "missing": missing,
-        "mesh": mesh_result,  # None unless both workspaces auto-detected
+        "metrics":     rows,
+        "cat_scores":  cat_scores,
+        "score":       overall,
+        "missing":     missing,
+        "mesh":        mesh_result,
+        "group_a_size":  len(ws_list_a),
+        "group_b_size":  len(ws_list_b),
+        "group_a_names": [ws.name for ws in ws_list_a],
+        "group_b_names": [ws.name for ws in ws_list_b],
+        "avg_proportions_a": pa,
+        "avg_proportions_b": pb,
     }
 
+
+def run_comparison(ws_a, ws_b) -> dict:
+    """
+    Backward-compatible 1-vs-1 wrapper. Identical output to the previous
+    run_comparison; new code should use run_group_comparison directly.
+    """
+    return run_group_comparison([ws_a], [ws_b])
+
+
+# ===========================================================================
+# Group → solo mapping  (uses averaged proportions as the target)
+# ===========================================================================
+
+def compute_mapped_landmarks_from_proportions(ws_source, target_props: dict,
+                                              target_ref_canonical: dict = None) -> dict:
+    """
+    Like compute_mapped_landmarks, but uses an averaged proportion vector
+    instead of a target workspace. This is how group → solo mapping works:
+    we don't have a "target image," we have target proportions averaged
+    across the group.
+
+    Approach:
+      Compute where each named landmark "should be" on the source image
+      such that source achieves the target proportions. We do this by
+      using the existing canonical-frame trick: average the GROUP's
+      named-landmark positions in canonical space, then project them
+      back through the source's canonical frame.
+
+      target_ref_canonical is required: a dict {key: (along, perp)} of
+      named landmarks averaged across the group in canonical space.
+    """
+    if not target_ref_canonical:
+        return {}
+
+    lm_s = _effective_landmarks(ws_source)
+    axis_s = _face_axis(lm_s)
+    if axis_s is None:
+        return {}
+    cs_x, cs_y, ds_x, ds_y = axis_s
+
+    H_s = _ref_length(lm_s)
+    if not H_s or H_s < 1:
+        return {}
+
+    ps_x, ps_y = _resolve_perp_sign(ds_y, -ds_x, lm_s, cs_x, cs_y)
+
+    mapped = {}
+    for key, (along, perp) in target_ref_canonical.items():
+        mx = cs_x + along * H_s * ds_x + perp * H_s * ps_x
+        my = cs_y + along * H_s * ds_y + perp * H_s * ps_y
+        mapped[key] = (int(round(mx)), int(round(my)))
+    return mapped
+
+
+def average_named_landmarks_canonical(ws_list: list) -> dict:
+    """
+    Average each named landmark's position across a group of workspaces,
+    in canonical face-normalized coords. Returns {key: (along, perp)}.
+    Skips members where a key has no value.
+    """
+    per_member = []
+    for ws in ws_list:
+        lm = _effective_landmarks(ws)
+        axis = _face_axis(lm)
+        if axis is None:
+            continue
+        cx, cy, dx, dy = axis
+        H = _ref_length(lm)
+        if H is None or H < 1:
+            continue
+        px, py = _resolve_perp_sign(dy, -dx, lm, cx, cy)
+
+        member = {}
+        for key, (kx, ky) in lm.items():
+            vx = kx - cx
+            vy = ky - cy
+            along = (vx * dx + vy * dy) / H
+            perp  = (vx * px + vy * py) / H
+            member[key] = (along, perp)
+        per_member.append(member)
+
+    if not per_member:
+        return {}
+
+    averaged = {}
+    all_keys = set()
+    for m in per_member:
+        all_keys.update(m.keys())
+    for key in all_keys:
+        vals = [m[key] for m in per_member if key in m]
+        if vals:
+            avg_along = sum(v[0] for v in vals) / len(vals)
+            avg_perp  = sum(v[1] for v in vals) / len(vals)
+            averaged[key] = (avg_along, avg_perp)
+    return averaged
 
 # ===========================================================================
 # Tab-selection dialog
@@ -2507,46 +2748,146 @@ class CompareSelectDialog(tk.Toplevel):
     def __init__(self, master: FaceLandmarkApp, tabs: list):
         super().__init__(master)
         self.master_app = master
-        self.tabs       = tabs
-        self.title("Select Two Tabs to Compare")
+        self.tabs = tabs   # list of (idx, ws)
+        self.title("Select Tabs to Compare")
         self.resizable(False, False)
         self.configure(bg="#1a1a2e")
         self.grab_set()
 
-        tk.Label(self, text="Choose Face A:", bg="#1a1a2e", fg="#ffffff",
-                 font=("Helvetica", 10)).grid(row=0, column=0, padx=14, pady=(16,4), sticky="w")
-        tk.Label(self, text="Choose Face B:", bg="#1a1a2e", fg="#ffffff",
-                 font=("Helvetica", 10)).grid(row=1, column=0, padx=14, pady=4, sticky="w")
+        intro = tk.Label(
+            self,
+            text="Select tabs for each group. Either side can have multiple tabs.\n"
+                 "When a side has multiple tabs, its measurements are averaged.",
+            bg="#1a1a2e", fg="#aaaaaa", font=("Helvetica", 9),
+            justify="left", padx=14)
+        intro.grid(row=0, column=0, columnspan=2, sticky="w", pady=(12, 8))
 
-        names = [ws.name for _, ws in tabs]
-        self.var_a = tk.StringVar(value=names[0])
-        self.var_b = tk.StringVar(value=names[1] if len(names) > 1 else names[0])
+        # Two columns of checkboxes
+        tk.Label(self, text="Group A", bg="#1a1a2e", fg="#00d4ff",
+                 font=("Helvetica", 10, "bold")
+                 ).grid(row=1, column=0, padx=14, pady=(4, 4), sticky="w")
+        tk.Label(self, text="Group B", bg="#1a1a2e", fg="#ff6b35",
+                 font=("Helvetica", 10, "bold")
+                 ).grid(row=1, column=1, padx=14, pady=(4, 4), sticky="w")
 
-        ttk.Combobox(self, textvariable=self.var_a, values=names,
-                     state="readonly", width=22).grid(row=0, column=1, padx=14, pady=(16,4))
-        ttk.Combobox(self, textvariable=self.var_b, values=names,
-                     state="readonly", width=22).grid(row=1, column=1, padx=14, pady=4)
+        list_a_frame = tk.Frame(self, bg="#0d0d1a", padx=4, pady=4)
+        list_a_frame.grid(row=2, column=0, padx=14, pady=4, sticky="nsew")
+        list_b_frame = tk.Frame(self, bg="#0d0d1a", padx=4, pady=4)
+        list_b_frame.grid(row=2, column=1, padx=14, pady=4, sticky="nsew")
 
+        # Build per-tab variables
+        self.vars_a: list[tk.BooleanVar] = []
+        self.vars_b: list[tk.BooleanVar] = []
+        self.tab_names: list[str] = [ws.name for _, ws in tabs]
+        self.checks_a: list[tk.Checkbutton] = []
+        self.checks_b: list[tk.Checkbutton] = []
+
+        for i, name in enumerate(self.tab_names):
+            va = tk.BooleanVar(value=False)
+            vb = tk.BooleanVar(value=False)
+            self.vars_a.append(va)
+            self.vars_b.append(vb)
+
+            ca = tk.Checkbutton(
+                list_a_frame, text=name, variable=va,
+                bg="#0d0d1a", fg="#cccccc", selectcolor="#0f3460",
+                activebackground="#0d0d1a", activeforeground="#ffffff",
+                font=("Helvetica", 9), anchor="w", padx=4, pady=2,
+                command=lambda idx=i: self._on_check_a(idx))
+            ca.pack(fill="x", anchor="w")
+            self.checks_a.append(ca)
+
+            cb = tk.Checkbutton(
+                list_b_frame, text=name, variable=vb,
+                bg="#0d0d1a", fg="#cccccc", selectcolor="#0f3460",
+                activebackground="#0d0d1a", activeforeground="#ffffff",
+                font=("Helvetica", 9), anchor="w", padx=4, pady=2,
+                command=lambda idx=i: self._on_check_b(idx))
+            cb.pack(fill="x", anchor="w")
+            self.checks_b.append(cb)
+
+        # Default: first tab in A, second in B (matches previous behavior)
+        if len(self.vars_a) >= 1:
+            self.vars_a[0].set(True)
+        if len(self.vars_b) >= 2:
+            self.vars_b[1].set(True)
+        elif len(self.vars_b) >= 1:
+            self.vars_b[0].set(True)
+
+        # Status / hint line
+        self.hint_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self.hint_var, bg="#1a1a2e", fg="#888888",
+                 font=("Helvetica", 9), padx=14
+                 ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # Buttons
         bf = tk.Frame(self, bg="#1a1a2e")
-        bf.grid(row=2, column=0, columnspan=2, pady=14)
-        ttk.Button(bf, text="Compare", command=self._go).pack(side="left", padx=6)
-        ttk.Button(bf, text="Cancel",  command=self.destroy).pack(side="left", padx=6)
+        bf.grid(row=4, column=0, columnspan=2, pady=14)
+        self.compare_button = ttk.Button(bf, text="Compare", command=self._go)
+        self.compare_button.pack(side="left", padx=6)
+        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side="left", padx=6)
+
+        self._refresh_state()
 
         self.update_idletasks()
         x = master.winfo_x() + master.winfo_width()  // 2 - self.winfo_width()  // 2
         y = master.winfo_y() + master.winfo_height() // 2 - self.winfo_height() // 2
         self.geometry(f"+{x}+{y}")
 
-    def _go(self):
-        na, nb = self.var_a.get(), self.var_b.get()
-        if na == nb:
-            messagebox.showwarning("Same Tab", "Select two different tabs.", parent=self); return
-        ws_a = next(ws for _, ws in self.tabs if ws.name == na)
-        ws_b = next(ws for _, ws in self.tabs if ws.name == nb)
-        result = run_comparison(ws_a, ws_b)
-        self.destroy()
-        CompareResultsWindow(self.master_app, na, nb, ws_a, ws_b, result)
+    def _on_check_a(self, idx: int):
+        # If checked in A and also in B, uncheck in B (no double-counting)
+        if self.vars_a[idx].get() and self.vars_b[idx].get():
+            self.vars_b[idx].set(False)
+        self._refresh_state()
 
+    def _on_check_b(self, idx: int):
+        if self.vars_b[idx].get() and self.vars_a[idx].get():
+            self.vars_a[idx].set(False)
+        self._refresh_state()
+
+    def _refresh_state(self):
+        n_a = sum(1 for v in self.vars_a if v.get())
+        n_b = sum(1 for v in self.vars_b if v.get())
+        valid = n_a >= 1 and n_b >= 1
+
+        if not valid:
+            self.hint_var.set("  Select at least one tab in each group.")
+        else:
+            parts = []
+            if n_a == 1:
+                parts.append("Group A: 1 tab")
+            else:
+                parts.append(f"Group A: {n_a} tabs (averaged)")
+            if n_b == 1:
+                parts.append("Group B: 1 tab")
+            else:
+                parts.append(f"Group B: {n_b} tabs (averaged)")
+            self.hint_var.set("  " + "   ·   ".join(parts))
+
+        if valid:
+            self.compare_button.state(["!disabled"])
+        else:
+            self.compare_button.state(["disabled"])
+
+    def _selected_workspaces(self, vars_list) -> list:
+        result = []
+        for i, v in enumerate(vars_list):
+            if v.get():
+                result.append(self.tabs[i][1])  # workspace, not (idx, ws)
+        return result
+
+    def _go(self):
+        ws_list_a = self._selected_workspaces(self.vars_a)
+        ws_list_b = self._selected_workspaces(self.vars_b)
+        if not ws_list_a or not ws_list_b:
+            messagebox.showwarning("Selection",
+                                   "Each group needs at least one tab.",
+                                   parent=self)
+            return
+
+        result = run_group_comparison(ws_list_a, ws_list_b)
+        self.destroy()
+        CompareResultsWindow(self.master_app, ws_list_a, ws_list_b, result)
 
 # ===========================================================================
 # Results window
@@ -2572,13 +2913,34 @@ class CompareResultsWindow(tk.Toplevel):
         if pct < 35:  return "#ff9944"
         return "#ff5544"
 
-    def __init__(self, master, name_a: str, name_b: str,
-                 ws_a, ws_b, result: dict):
+    def __init__(self, master, ws_list_a: list, ws_list_b: list, result: dict):
         super().__init__(master)
         self.master_app = master
-        self.ws_a, self.ws_b = ws_a, ws_b
-        self.name_a, self.name_b = name_a, name_b
-        self.title(f"Comparison  ·  {name_a}  vs  {name_b}")
+        self.ws_list_a = ws_list_a
+        self.ws_list_b = ws_list_b
+        self.result = result
+
+        # Build display names
+        n_a = len(ws_list_a)
+        n_b = len(ws_list_b)
+        if n_a == 1:
+            self.name_a = ws_list_a[0].name
+            self.label_a_short = ws_list_a[0].name[:10]
+            label_a_full = ws_list_a[0].name
+        else:
+            self.name_a = f"Group A ({n_a} tabs)"
+            self.label_a_short = f"Grp A ({n_a})"
+            label_a_full = self.name_a + ": " + ", ".join(ws.name for ws in ws_list_a)
+        if n_b == 1:
+            self.name_b = ws_list_b[0].name
+            self.label_b_short = ws_list_b[0].name[:10]
+            label_b_full = ws_list_b[0].name
+        else:
+            self.name_b = f"Group B ({n_b} tabs)"
+            self.label_b_short = f"Grp B ({n_b})"
+            label_b_full = self.name_b + ": " + ", ".join(ws.name for ws in ws_list_b)
+
+        self.title(f"Comparison  ·  {self.name_a}  vs  {self.name_b}")
         self.configure(bg="#0d0d1e")
         self.minsize(820, 600)
         self.resizable(True, True)
@@ -2592,13 +2954,11 @@ class CompareResultsWindow(tk.Toplevel):
         hdr = tk.Frame(self, bg="#0f3460", pady=10)
         hdr.pack(fill="x")
 
-        # Two-column header when mesh score is available
         mesh_data = result.get("mesh")
         if mesh_data is not None:
             cols = tk.Frame(hdr, bg="#0f3460")
             cols.pack()
 
-            # Left column: 50-metric score
             left = tk.Frame(cols, bg="#0f3460", padx=20)
             left.pack(side="left")
             tk.Label(left, text="50-Metric Score", bg="#0f3460", fg="#8899bb",
@@ -2609,10 +2969,8 @@ class CompareResultsWindow(tk.Toplevel):
             tk.Label(left, text="proportional anatomy",
                      bg="#0f3460", fg="#667799", font=("Helvetica", 8)).pack()
 
-            # Divider
             tk.Frame(cols, bg="#22335a", width=1, height=80).pack(side="left", fill="y")
 
-            # Right column: dense mesh score
             right = tk.Frame(cols, bg="#0f3460", padx=20)
             right.pack(side="left")
             mesh_score = mesh_data["score"]
@@ -2631,9 +2989,27 @@ class CompareResultsWindow(tk.Toplevel):
             tk.Label(hdr, text=f"{score:.1f} / 100",
                      bg="#0f3460", fg=self._score_color(score),
                      font=("Helvetica", 36, "bold")).pack()
+            # Why no mesh?
+            reason = self._mesh_unavailable_reason()
+            if reason:
+                tk.Label(hdr, text=f"Dense mesh: {reason}",
+                         bg="#0f3460", fg="#778899",
+                         font=("Helvetica", 8, "italic")).pack(pady=(4, 0))
 
-        tk.Label(hdr, text=f"{name_a}   vs   {name_b}",
-                 bg="#0f3460", fg="#778899", font=("Helvetica", 10)).pack(pady=(8, 0))
+        tk.Label(hdr, text=f"{self.name_a}   vs   {self.name_b}",
+                 bg="#0f3460", fg="#778899", font=("Helvetica", 10)
+                 ).pack(pady=(8, 0))
+
+        # Show full member lists when groups are multi
+        if n_a > 1 or n_b > 1:
+            tk.Label(hdr, text=f"A: {label_a_full}",
+                     bg="#0f3460", fg="#5f6f8a",
+                     font=("Helvetica", 8), wraplength=780, justify="left"
+                     ).pack(pady=(2, 0), padx=12)
+            tk.Label(hdr, text=f"B: {label_b_full}",
+                     bg="#0f3460", fg="#5f6f8a",
+                     font=("Helvetica", 8), wraplength=780, justify="left"
+                     ).pack(pady=(0, 0), padx=12)
 
         # ── Category sub-score bars ───────────────────────────────────
         cat_frame = tk.Frame(self, bg="#111130", pady=8)
@@ -2650,7 +3026,8 @@ class CompareResultsWindow(tk.Toplevel):
             cell.grid(row=row, column=col, padx=8, pady=3, sticky="w")
 
             tk.Label(cell, text=cat, bg="#111130", fg=meta["color"],
-                     font=("Helvetica", 8, "bold"), width=22, anchor="w").pack(side="left")
+                     font=("Helvetica", 8, "bold"), width=22, anchor="w"
+                     ).pack(side="left")
 
             bar_bg = tk.Frame(cell, bg="#1a1a33", width=100, height=10)
             bar_bg.pack(side="left", padx=(4, 6))
@@ -2669,11 +3046,11 @@ class CompareResultsWindow(tk.Toplevel):
         col_bar = tk.Frame(self, bg="#12122a")
         col_bar.pack(fill="x", padx=12, pady=(8, 0))
         for txt, w, anc in [
-            ("Metric",               28, "w"),
-            (f"{name_a[:10]}",       11, "center"),
-            (f"{name_b[:10]}",       11, "center"),
-            ("% Diff",                7, "center"),
-            ("Match",                14, "center"),
+            ("Metric",                 28, "w"),
+            (self.label_a_short,       11, "center"),
+            (self.label_b_short,       11, "center"),
+            ("% Diff",                  7, "center"),
+            ("Match",                  14, "center"),
         ]:
             tk.Label(col_bar, text=txt, bg="#12122a", fg="#556688",
                      font=("Helvetica", 8, "bold"), width=w, anchor=anc,
@@ -2700,7 +3077,6 @@ class CompareResultsWindow(tk.Toplevel):
         row_idx = 0
         current_cat = None
         for name, cat, weight, va, vb, pct in metrics:
-            # Category section header
             if cat != current_cat:
                 current_cat = cat
                 cat_color = CATEGORY_META[cat]["color"]
@@ -2709,7 +3085,8 @@ class CompareResultsWindow(tk.Toplevel):
                 cs = cat_scores.get(cat)
                 hdr_txt = cat + (f"   —   {cs:.0f}/100" if cs is not None else "")
                 tk.Label(sec, text=f"  {hdr_txt}", bg="#0a0a20", fg=cat_color,
-                         font=("Helvetica", 9, "bold"), pady=3, anchor="w").pack(fill="x")
+                         font=("Helvetica", 9, "bold"), pady=3, anchor="w"
+                         ).pack(fill="x")
                 row_idx += 1
 
             bg = "#0d0d1e" if row_idx % 2 == 0 else "#111128"
@@ -2736,7 +3113,6 @@ class CompareResultsWindow(tk.Toplevel):
                      font=("Helvetica", 8, "bold"), width=7,
                      anchor="center").grid(row=row_idx, column=3)
 
-            # Match bar
             bar_f = tk.Frame(inner, bg=bg, width=110, height=10)
             bar_f.grid(row=row_idx, column=4, padx=6, pady=4)
             bar_f.pack_propagate(False)
@@ -2748,7 +3124,6 @@ class CompareResultsWindow(tk.Toplevel):
 
             row_idx += 1
 
-        # ── Missing note ──────────────────────────────────────────────
         if missing:
             note = tk.Frame(self, bg="#18100a", pady=5)
             note.pack(fill="x", padx=12)
@@ -2761,44 +3136,83 @@ class CompareResultsWindow(tk.Toplevel):
         btn_row.pack(fill="x")
 
         ttk.Button(btn_row, text="Export Report (CSV)",
-                   command=lambda: self._export_csv(name_a, name_b, result)
+                   command=lambda: self._export_csv(self.name_a, self.name_b, result)
                    ).pack(side="left", padx=12)
 
-        # Separator
-        tk.Frame(btn_row, bg="#222244", width=1).pack(side="left", fill="y", padx=8)
+        # Map buttons — ONLY when one side is exactly 1 tab.
+        # The solo side is the target image; the other side (group or 1-tab)
+        # provides the proportions to map onto it.
+        solo_a = (n_a == 1)
+        solo_b = (n_b == 1)
 
-        # Map buttons
-        map_lbl = tk.Label(btn_row, text="Map onto new tab:",
-                           bg="#0d0d1e", fg="#778899", font=("Helvetica", 9))
-        map_lbl.pack(side="left")
+        if solo_a or solo_b:
+            tk.Frame(btn_row, bg="#222244", width=1).pack(side="left", fill="y", padx=8)
+            tk.Label(btn_row, text="Map onto new tab:",
+                     bg="#0d0d1e", fg="#778899", font=("Helvetica", 9)
+                     ).pack(side="left")
 
-        ttk.Button(
-            btn_row,
-            text=f"  {name_a[:14]}  →  {name_b[:14]}  ",
-            command=lambda: self._open_map("a_to_b")
-        ).pack(side="left", padx=4)
+            # If A is solo, we can map B's averaged proportions onto A.
+            if solo_a:
+                ttk.Button(
+                    btn_row,
+                    text=f"  {self.name_b[:14]}  →  {self.name_a[:14]}  ",
+                    command=lambda: self._open_map_group_to_solo("b_to_a")
+                ).pack(side="left", padx=4)
+            # If B is solo, we can map A's averaged proportions onto B.
+            if solo_b:
+                ttk.Button(
+                    btn_row,
+                    text=f"  {self.name_a[:14]}  →  {self.name_b[:14]}  ",
+                    command=lambda: self._open_map_group_to_solo("a_to_b")
+                ).pack(side="left", padx=4)
 
-        ttk.Button(
-            btn_row,
-            text=f"  {name_b[:14]}  →  {name_a[:14]}  ",
-            command=lambda: self._open_map("b_to_a")
-        ).pack(side="left", padx=4)
-
-        ttk.Button(btn_row, text="Close", command=self.destroy).pack(side="right", padx=12)
+        ttk.Button(btn_row, text="Close", command=self.destroy
+                   ).pack(side="right", padx=12)
 
         self.update_idletasks()
         mx = master.winfo_x() + master.winfo_width()  // 2 - self.winfo_width()  // 2
         my = master.winfo_y() + master.winfo_height() // 2 - self.winfo_height() // 2
         self.geometry(f"+{mx}+{my}")
 
-    def _open_map(self, direction: str):
-        """Open a mapping tab in the main app."""
+    def _mesh_unavailable_reason(self) -> Optional[str]:
+        """Explain why dense mesh score isn't shown."""
+        a_lacking = [ws.name for ws in self.ws_list_a if not ws.mesh_landmarks]
+        b_lacking = [ws.name for ws in self.ws_list_b if not ws.mesh_landmarks]
+        if a_lacking and b_lacking:
+            return "tabs in both groups lack mesh data (run Auto-Detect)"
+        if a_lacking:
+            return f"{len(a_lacking)} tab(s) in Group A lack mesh data"
+        if b_lacking:
+            return f"{len(b_lacking)} tab(s) in Group B lack mesh data"
+        return None
+    def _open_map_group_to_solo(self, direction: str):
+        """
+        Map averaged proportions from the source group onto the solo
+        target tab. direction='a_to_b' means A (group or solo) maps onto B (solo);
+        direction='b_to_a' means B maps onto A (solo).
+        """
         if direction == "a_to_b":
-            self.master_app.open_mapping_tab(
-                self.ws_a, self.ws_b, self.name_a, self.name_b)
+            source_group = self.ws_list_a
+            solo_target  = self.ws_list_b[0]
+            source_name  = self.name_a
+            target_name  = self.name_b
         else:
-            self.master_app.open_mapping_tab(
-                self.ws_b, self.ws_a, self.name_b, self.name_a)
+            source_group = self.ws_list_b
+            solo_target  = self.ws_list_a[0]
+            source_name  = self.name_b
+            target_name  = self.name_a
+
+        # Compute the source group's averaged named-landmark canonical positions
+        target_canonical = average_named_landmarks_canonical(source_group)
+        if not target_canonical:
+            messagebox.showerror(
+                "Cannot map",
+                "Could not compute averaged proportions from the source group.",
+                parent=self)
+            return
+
+        self.master_app.open_mapping_tab_from_canonical(
+            solo_target, target_canonical, source_name, target_name)
         self.destroy()
 
     def _export_csv(self, name_a, name_b, result):
