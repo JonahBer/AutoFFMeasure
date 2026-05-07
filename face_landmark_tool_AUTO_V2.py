@@ -297,10 +297,13 @@ class FaceLandmarkApp(tk.Tk):
         fm.add_command(label="Paste from Clipboard",  accelerator="Ctrl+V", command=self.paste_image)
         fm.add_command(label="Load Landmarks...",     accelerator="Ctrl+L", command=self.load_landmarks)
         fm.add_separator()
-        fm.add_command(label="Export -> JSON",        command=self.export_json)
-        fm.add_command(label="Export -> CSV",         command=self.export_csv)
+        fm.add_command(label="Export -> JSON", command=self.export_json)
+        fm.add_command(label="Export -> CSV", command=self.export_csv)
         fm.add_separator()
-        fm.add_command(label="Exit",                  command=self.quit)
+        fm.add_command(label="Batch Auto-Detect Folder...",
+                       command=self.batch_auto_detect_folder)
+        fm.add_separator()
+        fm.add_command(label="Exit", command=self.quit)
         mb.add_cascade(label="File", menu=fm)
 
         em = tk.Menu(mb, tearoff=False)
@@ -925,9 +928,12 @@ class FaceLandmarkApp(tk.Tk):
         self._drag_key = None
         self.canvas.config(cursor="crosshair" if self.ws.marking_mode else "arrow")
 
-        # Re-run estimation: any estimated points that depend on the moved
-        # source point (or the newly promoted point) need to be recomputed.
-        if self.ws.skipped_keys or self.ws.estimated_keys:
+        # Re-run estimation ONLY for points that were skipped during manual
+        # marking and got mirror-derived. Auto-detected workspaces (where every
+        # point is "estimated" because it came from MediaPipe) must NOT be
+        # re-derived — those positions came from the face mesh, not from
+        # mirroring placed points, so wiping & recomputing would destroy them.
+        if self.ws.skipped_keys:
             self._recompute_estimated()
 
     # ------------------------------------------------------------------
@@ -1371,6 +1377,45 @@ class FaceLandmarkApp(tk.Tk):
             )
         return self._face_mesh
 
+    def _run_mesh_on_image(self, pil_image):
+        """
+        Run MediaPipe Face Mesh on a PIL image. Returns a tuple
+        (mesh_landmarks, named_landmarks, estimated_keys) or None if
+        no face was detected. Pure data — does not touch any UI.
+        """
+        face_mesh = self._get_face_mesh()
+        if face_mesh is None:
+            return None
+
+        rgb = np.array(pil_image.convert("RGB"))
+        result = face_mesh.process(rgb)
+        if not result.multi_face_landmarks:
+            return None
+
+        h, w = rgb.shape[:2]
+        mesh = result.multi_face_landmarks[0].landmark
+        n_mesh = len(mesh)
+
+        mesh_landmarks = []
+        for pt in mesh:
+            mx = int(round(pt.x * w))
+            my = int(round(pt.y * h))
+            mx = max(0, min(mx, w - 1))
+            my = max(0, min(my, h - 1))
+            mesh_landmarks.append((mx, my))
+
+        named = {}
+        estimated = set()
+        for our_key, mesh_idx in MEDIAPIPE_INDEX_MAP.items():
+            if mesh_idx >= n_mesh:
+                continue
+            named[our_key] = mesh_landmarks[mesh_idx]
+            estimated.add(our_key)
+
+        return mesh_landmarks, named, estimated
+
+
+
     def auto_detect_landmarks(self):
         """Run MediaPipe Face Mesh on the current image and populate all
         landmarks as estimated. Wipes any existing landmarks first."""
@@ -1397,14 +1442,13 @@ class FaceLandmarkApp(tk.Tk):
         self.update_idletasks()
 
         try:
-            rgb = np.array(ws.original_image.convert("RGB"))
-            result = face_mesh.process(rgb)
+            detection = self._run_mesh_on_image(ws.original_image)
         except Exception as exc:
             messagebox.showerror("Detection failed", f"MediaPipe error:\n{exc}")
             self.status_var.set("Auto-detect failed.")
             return
 
-        if not result.multi_face_landmarks:
+        if detection is None:
             messagebox.showwarning(
                 "No face found",
                 "MediaPipe could not detect a face in this image.\n"
@@ -1413,39 +1457,23 @@ class FaceLandmarkApp(tk.Tk):
             self.status_var.set("No face detected.")
             return
 
-        h, w = rgb.shape[:2]
-        mesh = result.multi_face_landmarks[0].landmark
-        n_mesh = len(mesh)
+        mesh_landmarks, named, estimated_keys = detection
 
         # Wipe all existing state (per option A)
         ws.landmarks.clear()
         ws.skipped_keys.clear()
         ws.estimated_keys.clear()
-        ws.mesh_landmarks = []
         ws.marking_mode = False
         ws.current_step = TOTAL
         self.canvas.delete("marker")
         self.skip_btn.config(state="disabled")
 
-        # Store ALL 478 MediaPipe points (image-space coords) for dense comparison
-        for pt in mesh:
-            mx = int(round(pt.x * w))
-            my = int(round(pt.y * h))
-            mx = max(0, min(mx, w - 1))
-            my = max(0, min(my, h - 1))
-            ws.mesh_landmarks.append((mx, my))
+        ws.mesh_landmarks = mesh_landmarks
+        ws.landmarks = dict(named)
+        ws.estimated_keys = set(estimated_keys)
 
-        # Populate the 27 named landmarks as estimated (for the existing 50-metric system)
-        n_placed = 0
-        n_missed = 0
-        for our_key, mesh_idx in MEDIAPIPE_INDEX_MAP.items():
-            if mesh_idx >= n_mesh:
-                n_missed += 1
-                continue
-            x, y = ws.mesh_landmarks[mesh_idx]
-            ws.landmarks[our_key] = (x, y)
-            ws.estimated_keys.add(our_key)
-            n_placed += 1
+        n_placed = len(named)
+        n_missed = len(MEDIAPIPE_INDEX_MAP) - n_placed
 
         self.refresh_display()
         self._rebuild_list_panel()
@@ -1463,6 +1491,160 @@ class FaceLandmarkApp(tk.Tk):
         self.status_var.set(f"Auto-detect complete: {n_placed} landmarks placed as estimated.")
 
         messagebox.showinfo("Auto-detect complete", msg)
+
+    # ------------------------------------------------------------------
+    # Batch auto-detection (folder of images → folder of JSON+image pairs)
+    # ------------------------------------------------------------------
+
+    BATCH_IMAGE_EXTS = (".png",)  # .png only, per spec
+    BATCH_MAX_DEPTH = 2  # input folder + 1 level of subfolders
+
+    def batch_auto_detect_folder(self):
+        """Pick a folder of images, run Face Mesh on each, export
+        {stem}.json + {stem}_image.png pairs into a sibling output folder."""
+        if not MEDIAPIPE_AVAILABLE:
+            messagebox.showerror(
+                "MediaPipe not installed",
+                "Batch auto-detect requires MediaPipe and NumPy.\n\n"
+                "Install with:\n  pip install mediapipe numpy")
+            return
+        if not PIL_AVAILABLE:
+            messagebox.showerror("Pillow required", "pip install Pillow")
+            return
+
+        in_folder = filedialog.askdirectory(
+            title="Select folder of images to batch-process")
+        if not in_folder:
+            return
+        in_folder = os.path.abspath(in_folder)
+
+        # Collect images, depth-2 walk
+        image_paths = self._scan_folder_for_images(in_folder,
+                                                   self.BATCH_MAX_DEPTH,
+                                                   self.BATCH_IMAGE_EXTS)
+        if not image_paths:
+            messagebox.showwarning(
+                "No images found",
+                f"No PNG files found in {os.path.basename(in_folder)} "
+                f"(searched {self.BATCH_MAX_DEPTH} level(s) deep).")
+            return
+
+        # Resolve output folder name
+        parent = os.path.dirname(in_folder)
+        base = os.path.basename(in_folder)
+        out_folder = os.path.join(parent, f"{base}_landmarks")
+        n = 2
+        while os.path.exists(out_folder):
+            out_folder = os.path.join(parent, f"{base}_landmarks_{n}")
+            n += 1
+        try:
+            os.makedirs(out_folder, exist_ok=False)
+        except Exception as exc:
+            messagebox.showerror("Cannot create output folder", str(exc))
+            return
+
+        # Confirm before starting
+        if not messagebox.askyesno(
+                "Begin batch auto-detect",
+                f"Found {len(image_paths)} PNG file(s) in:\n  {in_folder}\n\n"
+                f"Output will be written to:\n  {out_folder}\n\nProceed?"):
+            try:
+                os.rmdir(out_folder)
+            except Exception:
+                pass
+            return
+
+        BatchProgressDialog(self, image_paths, in_folder, out_folder)
+
+    @staticmethod
+    def _scan_folder_for_images(root_folder: str, max_depth: int,
+                                exts: tuple) -> list:
+        """Walk root_folder up to max_depth levels, return absolute paths
+        to files matching exts. Same depth math as the JSON scanner."""
+        found = []
+        root_folder = os.path.abspath(root_folder)
+        if not os.path.isdir(root_folder):
+            return found
+        exts_lower = tuple(e.lower() for e in exts)
+
+        for current_dir, subdirs, files in os.walk(root_folder):
+            rel = os.path.relpath(current_dir, root_folder)
+            depth = 1 if rel == "." else 1 + rel.count(os.sep) + 1
+            if depth > max_depth:
+                subdirs[:] = []
+                continue
+            for fname in files:
+                if fname.lower().endswith(exts_lower):
+                    found.append(os.path.join(current_dir, fname))
+        return sorted(found)
+
+    def batch_export_one(self, image_path: str, out_folder: str) -> str:
+        """
+        Process a single image: run Face Mesh, write the JSON + paired
+        image into out_folder. Returns a status string:
+          "ok"          — exported successfully
+          "no_face"     — MediaPipe found no face
+          "load_failed" — couldn't open the image
+          "error: ..."  — other failure (message follows)
+        """
+        try:
+            img = Image.open(image_path)
+            img.load()
+        except Exception as exc:
+            return f"load_failed: {exc}"
+
+        try:
+            detection = self._run_mesh_on_image(img)
+        except Exception as exc:
+            return f"error: {exc}"
+
+        if detection is None:
+            return "no_face"
+
+        mesh_landmarks, named, estimated_keys = detection
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+
+        # Sanitize stem to avoid collisions with weird filenames
+        safe_stem = "".join(c if (c.isalnum() or c in "-_.") else "_"
+                            for c in stem)
+        if not safe_stem:
+            safe_stem = "image"
+
+        # Avoid overwriting if a sanitized collision occurs
+        json_path = os.path.join(out_folder, f"{safe_stem}.json")
+        img_path = os.path.join(out_folder, f"{safe_stem}{self.IMAGE_COPY_SUFFIX}")
+        suffix = 2
+        while os.path.exists(json_path) or os.path.exists(img_path):
+            json_path = os.path.join(out_folder, f"{safe_stem}_{suffix}.json")
+            img_path = os.path.join(out_folder,
+                                    f"{safe_stem}_{suffix}{self.IMAGE_COPY_SUFFIX}")
+            suffix += 1
+
+        # Write paired image (always PNG, matches IMAGE_COPY_SUFFIX)
+        try:
+            img.save(img_path, format="PNG")
+        except Exception as exc:
+            return f"error: image save failed: {exc}"
+
+        # Build payload matching export_json's format
+        payload = {
+            "total_landmarks": len(named),
+            "image_size": list(img.size),
+            "paired_image": os.path.basename(img_path),
+            "skipped_keys": [],
+            "estimated_keys": list(estimated_keys),
+            "landmarks": {k: {"x": v[0], "y": v[1], "status": "estimated"}
+                          for k, v in named.items()},
+            "mesh_landmarks": [list(p) for p in mesh_landmarks],
+        }
+        try:
+            with open(json_path, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as exc:
+            return f"error: json save failed: {exc}"
+
+        return "ok"
+
 
     # ------------------------------------------------------------------
     # Mapping tab  (opens a new tab showing original + 100%-target overlay)
@@ -2819,6 +3001,150 @@ def _build_workspace_from_json(json_path: str) -> Optional[Workspace]:
     ws.mesh_landmarks = mesh
     ws.current_step = TOTAL
     return ws
+
+# ===========================================================================
+# Batch processing progress dialog
+# ===========================================================================
+
+class BatchProgressDialog(tk.Toplevel):
+
+    def __init__(self, master: FaceLandmarkApp, image_paths: list,
+                 in_folder: str, out_folder: str):
+        super().__init__(master)
+        self.master_app = master
+        self.image_paths = image_paths
+        self.in_folder = in_folder
+        self.out_folder = out_folder
+        self.cancel_requested = False
+        self.done = False
+
+        self.title("Batch Auto-Detect")
+        self.configure(bg="#1a1a2e")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.grab_set()
+
+        n = len(image_paths)
+
+        tk.Label(self, text=f"Processing {n} image(s)...",
+                 bg="#1a1a2e", fg="#e0e0e0",
+                 font=("Helvetica", 11, "bold"), padx=20
+                 ).pack(pady=(14, 4))
+
+        tk.Label(self, text=f"Output: {out_folder}",
+                 bg="#1a1a2e", fg="#888888", font=("Helvetica", 8),
+                 wraplength=480, justify="left", padx=20
+                 ).pack(pady=(0, 8))
+
+        # Progress bar
+        self.progress_var = tk.IntVar(value=0)
+        self.progress = ttk.Progressbar(
+            self, orient="horizontal", length=480, mode="determinate",
+            variable=self.progress_var, maximum=n)
+        self.progress.pack(padx=20, pady=4)
+
+        self.status_var = tk.StringVar(value="Starting...")
+        tk.Label(self, textvariable=self.status_var,
+                 bg="#1a1a2e", fg="#cccccc", font=("Courier", 9),
+                 wraplength=480, justify="left", padx=20
+                 ).pack(pady=4)
+
+        self.counts_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self.counts_var,
+                 bg="#1a1a2e", fg="#888888", font=("Helvetica", 9), padx=20
+                 ).pack(pady=(0, 8))
+
+        bf = tk.Frame(self, bg="#1a1a2e")
+        bf.pack(pady=(4, 14))
+        self.cancel_button = ttk.Button(bf, text="Cancel",
+                                        command=self._on_cancel)
+        self.cancel_button.pack(side="left", padx=6)
+        self.close_button = ttk.Button(bf, text="Close",
+                                       command=self._on_close,
+                                       state="disabled")
+        self.close_button.pack(side="left", padx=6)
+
+        # Counters
+        self.n_ok = 0
+        self.n_no_face = 0
+        self.n_failed = 0
+        self.failures = []   # list of (image_path, reason)
+        self.idx = 0
+
+        self.update_idletasks()
+        x = master.winfo_x() + master.winfo_width()  // 2 - self.winfo_width()  // 2
+        y = master.winfo_y() + master.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Kick off processing — one image per Tk idle cycle, keeps UI responsive
+        self.after(50, self._step)
+
+    def _on_cancel(self):
+        if self.done:
+            return
+        self.cancel_requested = True
+        self.status_var.set("Cancelling — finishing current image...")
+
+    def _on_close(self):
+        if self.done:
+            self.destroy()
+        else:
+            # Treat as cancel
+            self._on_cancel()
+
+    def _step(self):
+        if self.cancel_requested or self.idx >= len(self.image_paths):
+            self._finish()
+            return
+
+        path = self.image_paths[self.idx]
+        rel = os.path.relpath(path, self.in_folder)
+        self.status_var.set(f"[{self.idx + 1}/{len(self.image_paths)}]  {rel}")
+        self.update_idletasks()
+
+        result = self.master_app.batch_export_one(path, self.out_folder)
+
+        if result == "ok":
+            self.n_ok += 1
+        elif result == "no_face":
+            self.n_no_face += 1
+            self.failures.append((rel, "no face detected"))
+        else:
+            self.n_failed += 1
+            self.failures.append((rel, result))
+
+        self.idx += 1
+        self.progress_var.set(self.idx)
+        self.counts_var.set(
+            f"OK: {self.n_ok}   ·   No face: {self.n_no_face}   "
+            f"·   Failed: {self.n_failed}")
+
+        # Schedule next image
+        self.after(1, self._step)
+
+    def _finish(self):
+        self.done = True
+        self.cancel_button.config(state="disabled")
+        self.close_button.config(state="normal")
+        if self.cancel_requested:
+            self.status_var.set(f"Cancelled after {self.idx} image(s).")
+        else:
+            self.status_var.set(f"Done. Processed {self.idx} image(s).")
+
+        # Summary popup
+        msg = (f"Batch complete.\n\n"
+               f"  Successful:    {self.n_ok}\n"
+               f"  No face found: {self.n_no_face}\n"
+               f"  Failed:        {self.n_failed}\n\n"
+               f"Output folder:\n{self.out_folder}")
+        if self.failures and len(self.failures) <= 12:
+            msg += "\n\nFailures:\n"
+            msg += "\n".join(f"  • {r}: {reason}"
+                             for r, reason in self.failures[:12])
+        elif self.failures:
+            msg += f"\n\n({len(self.failures)} failures — too many to list)"
+
+        messagebox.showinfo("Batch Auto-Detect", msg, parent=self)
 
 # ===========================================================================
 # Tab-selection dialog
