@@ -2743,6 +2743,145 @@ def compute_mesh_comparison_canonical(canon_a: list, canon_b: list) -> Optional[
     }
 
 
+# ===========================================================================
+# Radial comparison  (single-anchor "spoke length" method)
+# ===========================================================================
+#
+# For each face:
+#   1. Pick a single central anchor — the bilaterally-fair midline centroid
+#      from _face_axis (same origin used for the canonical frame).
+#   2. For every named landmark, compute its straight-line distance to that
+#      anchor, then divide by face height.  This yields one number per
+#      landmark — a "spoke length" in face-height units.
+#   3. To compare two faces, walk the landmarks both faces have in common,
+#      take the percent difference of each spoke length, then average.
+#
+# This is intentionally weaker than the 50-metric and dense-mesh scores —
+# it ignores direction (a point 0.3 face-heights up vs 0.3 face-heights left
+# of the centroid both give the same number), so it conflates different
+# shapes that share an overall radial spread.  It is provided as a third,
+# independent cross-check rather than a replacement.
+#
+# Per-landmark percent differences above this threshold contribute the
+# maximum amount to the score floor.  Tuned roughly to match the spread
+# of the proportional score on real faces.
+_RADIAL_PCT_FLOOR = 35.0   # percent diff at which a single landmark scores 0
+
+
+def _radial_distances_for_workspace(ws) -> Optional[dict]:
+    """
+    Return {landmark_key: distance_from_centroid / face_height} for one
+    workspace.  Uses _effective_landmarks so mirror-derived points are
+    included.  Returns None if no face axis or face-height ref can be built.
+    """
+    lm = _effective_landmarks(ws)
+    axis = _face_axis(lm)
+    if axis is None:
+        return None
+    cx, cy, _dx, _dy = axis
+    H = _ref_length(lm)
+    if H is None or H < 1:
+        return None
+
+    radials = {}
+    for key, (x, y) in lm.items():
+        dx = x - cx
+        dy = y - cy
+        radials[key] = math.sqrt(dx * dx + dy * dy) / H
+    return radials
+
+
+def _average_radials(ws_list: list) -> Optional[dict]:
+    """
+    Average per-landmark radial distances across a group of workspaces.
+    For each landmark key, averages over members that produced a value.
+    Returns None if no member produced any radials at all.
+    """
+    per_member = []
+    for ws in ws_list:
+        r = _radial_distances_for_workspace(ws)
+        if r is not None:
+            per_member.append(r)
+    if not per_member:
+        return None
+
+    all_keys = set()
+    for r in per_member:
+        all_keys.update(r.keys())
+
+    averaged = {}
+    for key in all_keys:
+        vals = [r[key] for r in per_member if key in r]
+        if vals:
+            averaged[key] = sum(vals) / len(vals)
+    return averaged
+
+
+def compute_radial_comparison_canonical(rad_a: dict, rad_b: dict) -> Optional[dict]:
+    """
+    Compare two pre-computed radial-distance dicts (output of
+    _average_radials or _radial_distances_for_workspace).
+
+    Returns:
+      {
+        "score":       float (0-100, higher = more similar),
+        "mean_pct":    float (mean per-landmark percent difference),
+        "median_pct":  float,
+        "max_pct":     float,
+        "n_points":    int,
+        "per_landmark": list[(key, dist_a, dist_b, pct_diff)]   sorted worst→best
+      }
+    or None if the two dicts have no keys in common.
+    """
+    if not rad_a or not rad_b:
+        return None
+    common = set(rad_a) & set(rad_b)
+    if not common:
+        return None
+
+    per_landmark = []
+    pcts = []
+    for key in common:
+        a = rad_a[key]
+        b = rad_b[key]
+        avg = (a + b) / 2.0
+        if avg < 1e-9:
+            pct = 0.0
+        else:
+            pct = abs(a - b) / avg * 100.0
+        per_landmark.append((key, a, b, pct))
+        pcts.append(pct)
+
+    if not pcts:
+        return None
+
+    per_landmark.sort(key=lambda t: -t[3])   # worst-diff first
+    pcts.sort()
+    n = len(pcts)
+    mean_pct   = sum(pcts) / n
+    median_pct = pcts[n // 2]
+    max_pct    = pcts[-1]
+
+    score = max(0.0, min(100.0,
+                         100.0 * (1.0 - mean_pct / _RADIAL_PCT_FLOOR)))
+
+    return {
+        "score":        score,
+        "mean_pct":     mean_pct,
+        "median_pct":   median_pct,
+        "max_pct":      max_pct,
+        "n_points":     n,
+        "per_landmark": per_landmark,
+    }
+
+
+def compute_radial_comparison(ws_a, ws_b) -> Optional[dict]:
+    """1-vs-1 radial comparison wrapper."""
+    rad_a = _radial_distances_for_workspace(ws_a)
+    rad_b = _radial_distances_for_workspace(ws_b)
+    return compute_radial_comparison_canonical(rad_a, rad_b)
+
+
 def run_group_comparison(ws_list_a: list, ws_list_b: list) -> dict:
     """
     Generalized comparison between two groups of workspaces.
@@ -2811,12 +2950,20 @@ def run_group_comparison(ws_list_a: list, ws_list_b: list) -> dict:
     canon_b = _average_mesh_canonical(ws_list_b)
     mesh_result = compute_mesh_comparison_canonical(canon_a, canon_b)
 
+    # Radial comparison — single-anchor "spoke length" cross-check.
+    # Works whenever each side has at least one workspace with usable
+    # landmarks (no mesh-data dependency, so it survives manual tabs).
+    rad_a = _average_radials(ws_list_a)
+    rad_b = _average_radials(ws_list_b)
+    radial_result = compute_radial_comparison_canonical(rad_a, rad_b)
+
     return {
         "metrics":     rows,
         "cat_scores":  cat_scores,
         "score":       overall,
         "missing":     missing,
         "mesh":        mesh_result,
+        "radial":      radial_result,
         "group_a_size":  len(ws_list_a),
         "group_b_size":  len(ws_list_b),
         "group_a_names": [ws.name for ws in ws_list_a],
@@ -3516,47 +3663,55 @@ class CompareResultsWindow(tk.Toplevel):
         hdr = tk.Frame(self, bg="#0f3460", pady=10)
         hdr.pack(fill="x")
 
-        mesh_data = result.get("mesh")
+        mesh_data   = result.get("mesh")
+        radial_data = result.get("radial")
+
+        # Build the row of score panels dynamically: 50-metric is always
+        # shown; mesh is shown if available; radial is shown if available.
+        cols = tk.Frame(hdr, bg="#0f3460")
+        cols.pack()
+
+        def _add_score_panel(parent, title, score_val, subtitle):
+            panel = tk.Frame(parent, bg="#0f3460", padx=18)
+            panel.pack(side="left")
+            tk.Label(panel, text=title, bg="#0f3460", fg="#8899bb",
+                     font=("Helvetica", 9)).pack()
+            tk.Label(panel, text=f"{score_val:.1f} / 100",
+                     bg="#0f3460", fg=self._score_color(score_val),
+                     font=("Helvetica", 24, "bold")).pack()
+            tk.Label(panel, text=subtitle, bg="#0f3460", fg="#667799",
+                     font=("Helvetica", 8)).pack()
+            return panel
+
+        def _add_separator(parent):
+            tk.Frame(parent, bg="#22335a", width=1, height=80
+                     ).pack(side="left", fill="y")
+
+        # Always-present: 50-metric proportional score
+        _add_score_panel(cols, "50-Metric Score", score, "proportional anatomy")
+
         if mesh_data is not None:
-            cols = tk.Frame(hdr, bg="#0f3460")
-            cols.pack()
+            _add_separator(cols)
+            _add_score_panel(
+                cols, "Dense Mesh Score", mesh_data["score"],
+                f"{mesh_data['n_points']} pts · "
+                f"avg {mesh_data['mean_dist'] * 100:.2f}% face-height")
 
-            left = tk.Frame(cols, bg="#0f3460", padx=20)
-            left.pack(side="left")
-            tk.Label(left, text="50-Metric Score", bg="#0f3460", fg="#8899bb",
-                     font=("Helvetica", 9)).pack()
-            tk.Label(left, text=f"{score:.1f} / 100",
-                     bg="#0f3460", fg=self._score_color(score),
-                     font=("Helvetica", 28, "bold")).pack()
-            tk.Label(left, text="proportional anatomy",
-                     bg="#0f3460", fg="#667799", font=("Helvetica", 8)).pack()
+        if radial_data is not None:
+            _add_separator(cols)
+            _add_score_panel(
+                cols, "Radial Score", radial_data["score"],
+                f"{radial_data['n_points']} pts · "
+                f"avg {radial_data['mean_pct']:.1f}% diff")
 
-            tk.Frame(cols, bg="#22335a", width=1, height=80).pack(side="left", fill="y")
-
-            right = tk.Frame(cols, bg="#0f3460", padx=20)
-            right.pack(side="left")
-            mesh_score = mesh_data["score"]
-            tk.Label(right, text="Dense Mesh Score", bg="#0f3460", fg="#8899bb",
-                     font=("Helvetica", 9)).pack()
-            tk.Label(right, text=f"{mesh_score:.1f} / 100",
-                     bg="#0f3460", fg=self._score_color(mesh_score),
-                     font=("Helvetica", 28, "bold")).pack()
-            tk.Label(right,
-                     text=f"{mesh_data['n_points']} points · "
-                          f"avg {mesh_data['mean_dist'] * 100:.2f}% face-height",
-                     bg="#0f3460", fg="#667799", font=("Helvetica", 8)).pack()
-        else:
-            tk.Label(hdr, text="Overall Similarity Score", bg="#0f3460", fg="#8899bb",
-                     font=("Helvetica", 10)).pack()
-            tk.Label(hdr, text=f"{score:.1f} / 100",
-                     bg="#0f3460", fg=self._score_color(score),
-                     font=("Helvetica", 36, "bold")).pack()
-            # Why no mesh?
+        # If mesh isn't available, explain why (only shown when at least one
+        # other panel is present; we always have the 50-metric panel).
+        if mesh_data is None:
             reason = self._mesh_unavailable_reason()
             if reason:
                 tk.Label(hdr, text=f"Dense mesh: {reason}",
                          bg="#0f3460", fg="#778899",
-                         font=("Helvetica", 8, "italic")).pack(pady=(4, 0))
+                         font=("Helvetica", 8, "italic")).pack(pady=(6, 0))
 
         tk.Label(hdr, text=f"{self.name_a}   vs   {self.name_b}",
                  bg="#0f3460", fg="#778899", font=("Helvetica", 10)
@@ -3686,6 +3841,59 @@ class CompareResultsWindow(tk.Toplevel):
 
             row_idx += 1
 
+        # ── Radial per-landmark breakdown (appended to same scroll table) ──
+        if radial_data is not None and radial_data.get("per_landmark"):
+            radial_color = "#bb88ff"   # distinct from the existing CATEGORY_META colors
+            sec = tk.Frame(inner, bg="#0a0a20")
+            sec.grid(row=row_idx, column=0, columnspan=5, sticky="ew", pady=(6, 0))
+            radial_score = radial_data["score"]
+            hdr_txt = (f"Radial Distance (from face centroid)   —   "
+                       f"{radial_score:.0f}/100")
+            tk.Label(sec, text=f"  {hdr_txt}", bg="#0a0a20", fg=radial_color,
+                     font=("Helvetica", 9, "bold"), pady=3, anchor="w"
+                     ).pack(fill="x")
+            row_idx += 1
+
+            # Sub-header explaining the values
+            sub = tk.Frame(inner, bg="#0a0a20")
+            sub.grid(row=row_idx, column=0, columnspan=5, sticky="ew")
+            tk.Label(sub,
+                     text=("    Distance from each landmark to the face's "
+                           "midline centroid, normalized by face height. "
+                           "Sorted worst → best."),
+                     bg="#0a0a20", fg="#667799",
+                     font=("Helvetica", 8, "italic"), anchor="w"
+                     ).pack(fill="x", padx=4, pady=(0, 2))
+            row_idx += 1
+
+            for key, da, db, pct in radial_data["per_landmark"]:
+                bg = "#0d0d1e" if row_idx % 2 == 0 else "#111128"
+
+                tk.Label(inner, text=key, bg=bg, fg="#ccccdd",
+                         font=("Helvetica", 8), width=28, anchor="w",
+                         pady=4, padx=6).grid(row=row_idx, column=0, sticky="w")
+
+                for ci, val in enumerate((da, db)):
+                    tk.Label(inner, text=f"{val:.4f}", bg=bg, fg="#9999bb",
+                             font=("Courier", 8), width=11,
+                             anchor="center").grid(row=row_idx, column=ci + 1)
+
+                pct_fg = self._pct_color(pct)
+                tk.Label(inner, text=f"{pct:.1f}%", bg=bg, fg=pct_fg,
+                         font=("Helvetica", 8, "bold"), width=7,
+                         anchor="center").grid(row=row_idx, column=3)
+
+                bar_f = tk.Frame(inner, bg=bg, width=110, height=10)
+                bar_f.grid(row=row_idx, column=4, padx=6, pady=4)
+                bar_f.pack_propagate(False)
+                fill_w = max(0, int(110 * max(0, 100 - pct * 2) / 100))
+                tk.Frame(bar_f, bg=pct_fg,    width=fill_w,
+                         height=10).place(x=0, y=0)
+                tk.Frame(bar_f, bg="#1a1a33", width=110 - fill_w,
+                         height=10).place(x=fill_w, y=0)
+
+                row_idx += 1
+
         if missing:
             note = tk.Frame(self, bg="#18100a", pady=5)
             note.pack(fill="x", padx=12)
@@ -3799,8 +4007,34 @@ class CompareResultsWindow(tk.Toplevel):
                             f"{va:.5f}" if va is not None else "",
                             f"{vb:.5f}" if vb is not None else "",
                             f"{pct:.2f}%" if pct is not None else "N/A"])
+
+            # Radial per-landmark breakdown (appended after all categories)
+            radial_data = result.get("radial")
+            if radial_data is not None and radial_data.get("per_landmark"):
+                w.writerow([])
+                w.writerow([f"=== Radial Distance (from centroid)", "", "", "",
+                            f"Radial Score: {radial_data['score']:.1f}/100"])
+                w.writerow(["Radial", "Landmark",
+                            f"{name_a} (dist/H)", f"{name_b} (dist/H)",
+                            "% Difference"])
+                for key, da, db, pct in radial_data["per_landmark"]:
+                    w.writerow(["Radial", key,
+                                f"{da:.5f}", f"{db:.5f}", f"{pct:.2f}%"])
+                w.writerow(["Radial", "(summary)",
+                            f"mean: {radial_data['mean_pct']:.2f}%",
+                            f"median: {radial_data['median_pct']:.2f}%",
+                            f"max: {radial_data['max_pct']:.2f}%"])
+
             w.writerow([])
-            w.writerow(["", "OVERALL SIMILARITY SCORE", "", "", f"{result['score']:.2f}/100"])
+            w.writerow(["", "OVERALL SIMILARITY SCORE (50-Metric)",
+                        "", "", f"{result['score']:.2f}/100"])
+            mesh_data = result.get("mesh")
+            if mesh_data is not None:
+                w.writerow(["", "DENSE MESH SCORE",
+                            "", "", f"{mesh_data['score']:.2f}/100"])
+            if radial_data is not None:
+                w.writerow(["", "RADIAL SCORE",
+                            "", "", f"{radial_data['score']:.2f}/100"])
         messagebox.showinfo("Exported", f"Saved to:\n{os.path.basename(path)}", parent=self)
 
 
@@ -3811,4 +4045,3 @@ class CompareResultsWindow(tk.Toplevel):
 if __name__ == "__main__":
     app = FaceLandmarkApp()
     app.mainloop()
-
