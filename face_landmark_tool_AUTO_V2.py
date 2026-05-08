@@ -1731,6 +1731,49 @@ class FaceLandmarkApp(tk.Tk):
         self.active_idx = len(self.workspaces) - 1
         self._restore_workspace(self.active_idx)
 
+    def open_mapping_tab_generic(self, ws_solo, mapped: dict,
+                                 source_name: str, target_name: str,
+                                 method_label: str = ""):
+        """
+        Generic mapping-tab opener. Caller supplies the pre-computed
+        {key: (x, y)} mapped landmarks (in source-image pixel coords) and
+        a short method tag like "50-Metric", "Mesh", or "Radial".
+        Used by all three method-specific mapping buttons.
+        """
+        if ws_solo.original_image is None:
+            messagebox.showerror("No image", f"'{target_name}' has no image.")
+            return
+        if not mapped:
+            messagebox.showerror(
+                "Cannot map",
+                "Not enough data to compute the mapping for this method."
+            )
+            return
+
+        self._snapshot_current()
+
+        suffix = f" [{method_label}]" if method_label else ""
+        new_ws = Workspace()
+        new_ws.name = f"Map: {source_name} → {target_name}{suffix}"
+        new_ws.original_image = ws_solo.original_image.copy()
+        stem_method = method_label.lower().replace(" ", "_") or "map"
+        new_ws.image_stem = (
+            f"map_{stem_method}_{source_name}_to_{target_name}"
+            .replace(" ", "_"))
+        new_ws.landmarks = dict(ws_solo.landmarks)
+        new_ws.skipped_keys = set(ws_solo.skipped_keys)
+        new_ws.estimated_keys = set(ws_solo.estimated_keys)
+        new_ws.mapped_landmarks = mapped
+        new_ws.mapped_label = f"{source_name} → {target_name}{suffix}"
+        new_ws.zoom_str = "Fit"
+        new_ws.scale_factor = 1.0
+        new_ws.marking_mode = False
+        new_ws.current_step = TOTAL
+
+        self.workspaces.append(new_ws)
+        self.active_idx = len(self.workspaces) - 1
+        self._restore_workspace(self.active_idx)
+
     # ------------------------------------------------------------------
     # Compare
     # ------------------------------------------------------------------
@@ -3068,6 +3111,141 @@ def average_named_landmarks_canonical(ws_list: list) -> dict:
             averaged[key] = (avg_along, avg_perp)
     return averaged
 
+
+# ===========================================================================
+# Method-specific mapping  (one mapping function per comparison metric)
+# ===========================================================================
+#
+# Each comparison method measures something different; therefore each
+# answers a different "where should the landmarks go?" question:
+#
+#   • 50-metric  → match the target's NAMED-LANDMARK canonical (along, perp).
+#                  This is the original compute_mapped_landmarks behavior.
+#   • Mesh       → match the target's FULL-MESH canonical position for each
+#                  named landmark (looked up via MEDIAPIPE_INDEX_MAP).
+#                  Requires mesh data on both sides.
+#   • Radial     → match the target's normalized RADIAL DISTANCE only.
+#                  Direction is preserved from the source — each diamond
+#                  slides along the line from centroid to current landmark.
+#
+# All three return {key: (x, y)} in source-image pixel coords.
+# ---------------------------------------------------------------------------
+
+
+def _named_landmark_canonical_from_mesh(ws) -> Optional[dict]:
+    """
+    For a workspace with mesh data, look up each named landmark's position
+    via MEDIAPIPE_INDEX_MAP, transform into canonical (along, perp) coords
+    using the workspace's _face_axis frame, and return {key: (along, perp)}.
+
+    Differs from average_named_landmarks_canonical by sourcing the named
+    positions from the MESH (MediaPipe's view) rather than the user's
+    landmarks dict — so when these are mapped onto a source, the source
+    matches the target's *mesh* anatomy, not just the target's named clicks.
+
+    Returns None if no mesh, no axis, or no face-height ref.
+    """
+    if not ws.mesh_landmarks:
+        return None
+    lm = _effective_landmarks(ws)
+    axis = _face_axis(lm)
+    if axis is None:
+        return None
+    cx, cy, dx, dy = axis
+    H = _ref_length(lm)
+    if H is None or H < 1:
+        return None
+    px, py = _resolve_perp_sign(dy, -dx, lm, cx, cy)
+
+    n_mesh = len(ws.mesh_landmarks)
+    out = {}
+    for key, mesh_idx in MEDIAPIPE_INDEX_MAP.items():
+        if mesh_idx >= n_mesh:
+            continue
+        mx, my = ws.mesh_landmarks[mesh_idx]
+        vx = mx - cx
+        vy = my - cy
+        along = (vx * dx + vy * dy) / H
+        perp  = (vx * px + vy * py) / H
+        out[key] = (along, perp)
+    return out
+
+
+def average_named_landmarks_canonical_from_mesh(ws_list: list) -> Optional[dict]:
+    """
+    Like average_named_landmarks_canonical, but each member's named-landmark
+    canonical positions come from its MESH (via MEDIAPIPE_INDEX_MAP).
+    All-or-nothing: returns None if any member lacks mesh data.
+    """
+    per_member = []
+    for ws in ws_list:
+        m = _named_landmark_canonical_from_mesh(ws)
+        if m is None:
+            return None
+        per_member.append(m)
+    if not per_member:
+        return None
+
+    averaged = {}
+    all_keys = set()
+    for m in per_member:
+        all_keys.update(m.keys())
+    for key in all_keys:
+        vals = [m[key] for m in per_member if key in m]
+        if vals:
+            avg_along = sum(v[0] for v in vals) / len(vals)
+            avg_perp  = sum(v[1] for v in vals) / len(vals)
+            averaged[key] = (avg_along, avg_perp)
+    return averaged
+
+
+def compute_mapped_landmarks_radial(ws_source, target_radials: dict) -> dict:
+    """
+    Radial-only mapping. For each landmark the source has, slide it along
+    the line from source's centroid to the landmark's current position so
+    that its radius (distance from centroid / source face height) equals
+    the target's normalized radial value.
+
+    Direction information is intentionally preserved from the source —
+    radial comparison ignores direction, so the diamond marker only
+    answers "how far from center?" and never moves the point sideways.
+
+    target_radials: {key: dist_from_centroid / face_height}, typically
+    from _radial_distances_for_workspace or _average_radials.
+    """
+    if not target_radials:
+        return {}
+
+    lm_s = _effective_landmarks(ws_source)
+    axis_s = _face_axis(lm_s)
+    if axis_s is None:
+        return {}
+    cs_x, cs_y, _ds_x, _ds_y = axis_s
+    H_s = _ref_length(lm_s)
+    if not H_s or H_s < 1:
+        return {}
+
+    mapped = {}
+    for key, (sx, sy) in lm_s.items():
+        if key not in target_radials:
+            continue
+        target_r = target_radials[key]   # already normalized by target's H
+        # Direction vector from centroid to source landmark
+        dx = sx - cs_x
+        dy = sy - cs_y
+        cur_dist = math.sqrt(dx * dx + dy * dy)
+        target_dist_pixels = target_r * H_s   # rescale into source pixel space
+        if cur_dist < 1e-9:
+            # Landmark sits exactly on the centroid — no direction to scale
+            # along. Best we can do is leave it there.
+            mapped[key] = (int(round(sx)), int(round(sy)))
+            continue
+        scale = target_dist_pixels / cur_dist
+        mx = cs_x + dx * scale
+        my = cs_y + dy * scale
+        mapped[key] = (int(round(mx)), int(round(my)))
+    return mapped
+
 # ===========================================================================
 # Folder-loaded comparison sources
 # ===========================================================================
@@ -3921,20 +4099,17 @@ class CompareResultsWindow(tk.Toplevel):
                      bg="#0d0d1e", fg="#778899", font=("Helvetica", 9)
                      ).pack(side="left")
 
-            # If A is solo, we can map B's averaged proportions onto A.
-            if solo_a:
-                ttk.Button(
-                    btn_row,
-                    text=f"  {self.name_b[:14]}  →  {self.name_a[:14]}  ",
-                    command=lambda: self._open_map_group_to_solo("b_to_a")
-                ).pack(side="left", padx=4)
-            # If B is solo, we can map A's averaged proportions onto B.
-            if solo_b:
-                ttk.Button(
-                    btn_row,
-                    text=f"  {self.name_a[:14]}  →  {self.name_b[:14]}  ",
-                    command=lambda: self._open_map_group_to_solo("a_to_b")
-                ).pack(side="left", padx=4)
+            # One button per comparison method, in each available direction.
+            # 50-metric: always available when at least one side is a solo
+            #            workspace with an image.
+            # Mesh:      requires every workspace in BOTH groups to have mesh
+            #            data (same all-or-nothing rule as the mesh score).
+            # Radial:    requires the radial result to be present.
+            mesh_ok   = mesh_data is not None
+            radial_ok = radial_data is not None
+
+            self._add_method_map_buttons(btn_row, solo_a, solo_b,
+                                         mesh_ok, radial_ok)
 
         ttk.Button(btn_row, text="Close", command=self.destroy
                    ).pack(side="right", padx=12)
@@ -3955,11 +4130,67 @@ class CompareResultsWindow(tk.Toplevel):
         if b_lacking:
             return f"{len(b_lacking)} tab(s) in Group B lack mesh data"
         return None
-    def _open_map_group_to_solo(self, direction: str):
+    def _add_method_map_buttons(self, btn_row, solo_a: bool, solo_b: bool,
+                                mesh_ok: bool, radial_ok: bool):
         """
-        Map averaged proportions from the source group onto the solo
-        target tab. direction='a_to_b' means A (group or solo) maps onto B (solo);
-        direction='b_to_a' means B maps onto A (solo).
+        Lay out one row of buttons per comparison method.
+        Each method gets a small label + one button per available direction
+        (B→A if A is solo, A→B if B is solo).  Methods stack vertically
+        inside a column so the button bar stays compact.
+        """
+        # Group everything in a sub-frame so we can stack rows
+        group = tk.Frame(btn_row, bg="#0d0d1e")
+        group.pack(side="left", padx=4)
+
+        label_a = self.name_a[:14]
+        label_b = self.name_b[:14]
+
+        method_specs = [
+            # (label, color, enabled, direction_runner)
+            ("50-Metric", "#aaccff", True,  "fifty"),
+            ("Mesh",      "#aaffcc", mesh_ok,   "mesh"),
+            ("Radial",    "#ddbbff", radial_ok, "radial"),
+        ]
+
+        for label, color, enabled, method_key in method_specs:
+            row = tk.Frame(group, bg="#0d0d1e")
+            row.pack(side="top", anchor="w", pady=1)
+
+            tk.Label(row, text=f" {label}: ", bg="#0d0d1e",
+                     fg=color if enabled else "#444455",
+                     font=("Helvetica", 8, "bold"), width=10, anchor="w"
+                     ).pack(side="left")
+
+            if solo_a:
+                btn = ttk.Button(
+                    row, text=f"  {label_b}  →  {label_a}  ",
+                    command=lambda mk=method_key:
+                        self._open_method_mapping(mk, "b_to_a"))
+                btn.pack(side="left", padx=2)
+                if not enabled:
+                    btn.state(["disabled"])
+            if solo_b:
+                btn = ttk.Button(
+                    row, text=f"  {label_a}  →  {label_b}  ",
+                    command=lambda mk=method_key:
+                        self._open_method_mapping(mk, "a_to_b"))
+                btn.pack(side="left", padx=2)
+                if not enabled:
+                    btn.state(["disabled"])
+
+    def _open_method_mapping(self, method_key: str, direction: str):
+        """
+        Open a mapping tab for a specific comparison method.
+
+        method_key ∈ {"fifty", "mesh", "radial"}
+          fifty  — match target's named-landmark canonical positions
+          mesh   — match target's MESH-derived canonical positions for
+                   each named landmark (requires mesh on both sides)
+          radial — match target's normalized radial distances; direction
+                   is preserved from the source.
+        direction ∈ {"a_to_b", "b_to_a"}
+          a_to_b — A's data maps onto B's image (B must be solo)
+          b_to_a — B's data maps onto A's image (A must be solo)
         """
         if direction == "a_to_b":
             source_group = self.ws_list_a
@@ -3972,17 +4203,66 @@ class CompareResultsWindow(tk.Toplevel):
             source_name  = self.name_b
             target_name  = self.name_a
 
-        # Compute the source group's averaged named-landmark canonical positions
-        target_canonical = average_named_landmarks_canonical(source_group)
-        if not target_canonical:
+        method_label_map = {
+            "fifty":  "50-Metric",
+            "mesh":   "Mesh",
+            "radial": "Radial",
+        }
+        method_label = method_label_map.get(method_key, method_key)
+
+        # Compute the mapped landmarks per method
+        mapped: dict = {}
+        if method_key == "fifty":
+            target_canonical = average_named_landmarks_canonical(source_group)
+            if not target_canonical:
+                messagebox.showerror(
+                    "Cannot map",
+                    "Could not compute averaged proportions from the source group.",
+                    parent=self)
+                return
+            mapped = compute_mapped_landmarks_from_proportions(
+                solo_target, None, target_canonical)
+
+        elif method_key == "mesh":
+            target_canonical = average_named_landmarks_canonical_from_mesh(
+                source_group)
+            if target_canonical is None or not target_canonical:
+                messagebox.showerror(
+                    "Cannot map (Mesh)",
+                    "Mesh mapping requires every source workspace to have\n"
+                    "MediaPipe mesh data. Run Auto-Detect on the source(s)\n"
+                    "first.",
+                    parent=self)
+                return
+            mapped = compute_mapped_landmarks_from_proportions(
+                solo_target, None, target_canonical)
+
+        elif method_key == "radial":
+            target_radials = _average_radials(source_group)
+            if not target_radials:
+                messagebox.showerror(
+                    "Cannot map (Radial)",
+                    "Could not compute radial distances from the source group.",
+                    parent=self)
+                return
+            mapped = compute_mapped_landmarks_radial(solo_target, target_radials)
+
+        else:
+            messagebox.showerror("Unknown method", f"Unknown mapping method: {method_key}",
+                                 parent=self)
+            return
+
+        if not mapped:
             messagebox.showerror(
                 "Cannot map",
-                "Could not compute averaged proportions from the source group.",
+                f"{method_label} mapping produced no landmarks.\n"
+                "The source and target may not share enough data.",
                 parent=self)
             return
 
-        self.master_app.open_mapping_tab_from_canonical(
-            solo_target, target_canonical, source_name, target_name)
+        self.master_app.open_mapping_tab_generic(
+            solo_target, mapped, source_name, target_name,
+            method_label=method_label)
         self.destroy()
 
     def _export_csv(self, name_a, name_b, result):
